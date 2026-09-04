@@ -1,0 +1,47 @@
+project_root: .
+
+# The 20 existing remote-memory full-run configs provide trace/model/benchmark
+# coverage. The runner rewrites relative model/hardware paths to absolutes.
+source_glob: configs/experiments/remote_mem/full_runs/*_remote_mem_bw09.yaml
+exclude_benchmarks:
+  - HuggingFaceH4
+
+generated_config_dir: runs/remote_mem/generated_configs/adaptive_extra_budget_sweep
+output_dir: runs/remote_mem/adaptive_extra_budget_sweep
+logs_dir: runs/remote_mem/adaptive_extra_budget_sweep_logs
+
+replay:
+  warmup_steps: 128
+  eval_steps: 1000
+  batch_sizes: [32, 64, 128]
+
+hardware:
+  bw045: configs/hardware/8gpu_h200_remote_mem_bw045.yaml
+  bw09: configs/hardware/8gpu_h200_remote_mem_bw09.yaml
+  bw18: configs/hardware/8gpu_h200_remote_mem_bw18.yaml
+
+scheduler:
+  # max: GPU/offload overlap within a layer; sum: serialized GPU + offload.
+  latency_combine_mode: max
+
+adaptive:
+  base_extra_copy_fraction: 0.25
+  fraction_sweep_model_slug: qwen3_235b_a22b_fp8
+  fraction_sweep_values: [0.0, 0.1, 0.25, 0.5]
+
+static_hot_cold:
+  enabled: true
+  hot_fraction: 0.5
+  base_cold_fraction: 0.25
+  cold_fraction_sweep_model_slug: qwen3_235b_a22b_fp8
+  cold_fraction_sweep_values: [0.0, 0.25, 0.5]
+  oracle_comparison: true
+
+gpu_baseline:
+  enabled: true
+  # GPU baseline is deduplicated across remote bandwidth because remote BW is unused.
+  hardware_key: bw09
+  oracle_comparison: false
+
+metrics:
+  level: summary

@@ -1,0 +1,59 @@
+# DeepSeek V2 family — class catalog (MLA + MoE decoder-only LLMs).
+#
+# Initial support added for deepseek-ai/DeepSeek-V2-Lite on vLLM 0.19.0.
+# DeepSeek V2 uses MLA attention and has one initial dense MLP layer
+# (`first_k_dense_replace=1`) followed by MoE layers. The current
+# simulator can consume this as a standard decoder flow by profiling the
+# vLLM MLA wrapper as `attention` and treating `DeepseekV2MoE` as `moe`.
+#
+# Note: with profiler hf_overrides.num_hidden_layers=1, the single live
+# decoder layer is layer 0, which is dense for DeepSeek-V2-Lite. The MoE
+# profiler may require forcing first_k_dense_replace=0 or special handling
+# if vLLM cannot expose a MoE layer in the one-layer test model.
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, attention]
+  post_attn: [layernorm]
+  mlp_dense: []
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2DecoderLayer
+      tp_stable: true
+    kv_a_proj:
+      vllm: ReplicatedLinear
+      within: DeepseekV2MLAAttention
+      tp_stable: true
+    kv_a_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2MLAAttention
+      tp_stable: true
+    rotary_emb:
+      vllm: DeepseekScalingRotaryEmbedding
+      tp_stable: true
+    o_proj:
+      vllm: RowParallelLinear
+      within: MultiHeadLatentAttentionWrapper
+    final_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2ForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: MultiHeadLatentAttentionWrapper
+  moe:
+    moe:
+      vllm: DeepseekV2MoE

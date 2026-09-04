@@ -1,0 +1,15 @@
+model:
+  model_id: cognitivecomputations/DeepSeek-R1-AWQ
+  short_name: deepseek_r1_awq
+  family: DeepSeek-R1
+  num_layers: 61
+  experts_per_layer: 256
+  top_k: 8
+  expert_weight_bytes: 44040192
+  metadata:
+    hidden_size: 7168
+    moe_intermediate_size: 2048
+    weight_dtype: fp8_assumed
+    expert_weight_formula: 3 * hidden_size * moe_intermediate_size * 1 byte
+    source_config: https://huggingface.co/cognitivecomputations/DeepSeek-R1-AWQ/blob/main/config.json
+    source_trace_pack: tracepacks/full/deepseek_r1_awq/mmlu/manifest.json

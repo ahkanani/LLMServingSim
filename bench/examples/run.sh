@@ -15,14 +15,10 @@ FORCE_COLOR="${FORCE_COLOR:-1}"
 
 export TERM LANG FORCE_COLOR
 
-# Examples are keyed by <hardware>/<model>, matching the directory layout
-# under this folder. Each one carries its own config.json, so nothing has
-# to be kept in sync with a parallel configs/ tree.
 DEFAULT_EXAMPLES=(
-    "RTXPRO6000/Llama-3.1-8B"
-    "RTXPRO6000/Qwen3-32B"
-    "RTXPRO6000/Qwen3-30B-A3B-Instruct-2507"
-    "RTX4090/Llama-3.1-8B"
+    "Llama-3.1-8B"
+    "Qwen3-32B"
+    "Qwen3-30B-A3B-Instruct-2507"
 )
 
 json_get() {
@@ -77,9 +73,9 @@ repo_relative_path() {
 }
 
 run_example() {
-    local model_dir="$1"   # <hardware>/<model>
+    local model_dir="$1"
     local meta="$SCRIPT_DIR/$model_dir/vllm/meta.json"
-    local config="$SCRIPT_DIR/$model_dir/config.json"
+    local config="$SCRIPT_DIR/configs/$model_dir.json"
     local config_rel
     local output_dir="$SCRIPT_DIR/$model_dir/outputs"
     local output_dir_rel
@@ -125,10 +121,6 @@ run_example() {
         --network-backend "$NETWORK_BACKEND"
     )
 
-    if [[ -n "${NPU_MEMORY_UTILIZATION:-}" ]]; then
-        cmd+=(--npu-memory-utilization "$NPU_MEMORY_UTILIZATION")
-    fi
-
     echo "============================================================"
     echo "Example: $model_dir"
     echo "Dataset: $dataset_cli"
@@ -147,11 +139,14 @@ if [[ $# -eq 0 ]]; then
 fi
 
 for example in "$@"; do
-    if [[ -d "$SCRIPT_DIR/$example" && -f "$SCRIPT_DIR/$example/config.json" ]]; then
-        run_example "$example"
-    else
-        echo "Unknown example: $example" >&2
-        echo "Known examples: ${DEFAULT_EXAMPLES[*]}" >&2
-        exit 2
-    fi
+    case "$example" in
+        Qwen3-32B|Qwen3-30B-A3B-Instruct-2507|Llama-3.1-8B)
+            run_example "$example"
+            ;;
+        *)
+            echo "Unknown example: $example" >&2
+            echo "Known examples: ${DEFAULT_EXAMPLES[*]}" >&2
+            exit 2
+            ;;
+    esac
 done

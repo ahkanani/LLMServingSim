@@ -16,7 +16,7 @@ inside the simulator container at `/app/LLMServingSim`.
 ```bash
 python -m serving \
   --cluster-config 'configs/cluster/single_node_single_instance.json' \
-  --dtype bfloat16 --block-size 16 \
+  --dtype float16 --block-size 16 \
   --dataset 'workloads/example_trace.jsonl' \
   --output 'outputs/example_single_run.csv' \
   --log-interval 1.0
@@ -40,17 +40,15 @@ once per second. After the run finishes:
 head outputs/example_single_run.csv
 ```
 
-shows the per-request output. The columns are `instance id`,
-`request id`, `model`, `input`, `output`, `arrival`, `end_time`,
-`latency`, `queuing_delay`, `TTFT`, `TPOT`, `ITL` — see
-**[Reading the output](/docs/simulator/reading-output)**.
+shows the per-request output (request id, prompt and decode tokens,
+TTFT, TPOT, end-to-end latency, …).
 
 ## What the flags mean
 
 | Flag | What it does |
 | --- | --- |
 | `--cluster-config` | Cluster topology + hardware. Generates ASTRA-Sim input files automatically. |
-| `--dtype` | Model weight precision (`float16`, `bfloat16`, `float32`, `fp8`, `int8`). Picks the matching profile bundle. Omit it and the model config's `torch_dtype` is used. |
+| `--dtype` | Model weight precision (`float16`, `bfloat16`, `float32`, `int8`). Picks the matching profile bundle. |
 | `--block-size` | KV-cache block size in tokens. Default `16`. |
 | `--dataset` | JSONL file of requests (or agentic sessions). |
 | `--output` | Where to write per-request metrics. |

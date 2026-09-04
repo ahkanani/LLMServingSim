@@ -109,12 +109,6 @@ def _resolve_parallelism(instance, model_config):
         raise ValueError(f"Parallelism degrees must be >= 1: tp_size={tp_size}, pp_size={pp_size}, ep_size={ep_size}")
     if dp_group is None and ep_size > tp_size:
         raise ValueError(f"ep_size ({ep_size}) > tp_size ({tp_size}) requires dp_group to be set")
-    num_hidden_layers = model_config.get("num_hidden_layers")
-    if num_hidden_layers is not None and pp_size > num_hidden_layers:
-        raise ValueError(
-            f"pp_size ({pp_size}) exceeds the model's transformer block count "
-            f"({num_hidden_layers}); a pipeline stage cannot be empty"
-        )
     if is_moe:
         num_experts = model_config.get(
             "num_local_experts", model_config.get("num_experts", 1)
@@ -131,7 +125,6 @@ def _resolve_parallelism(instance, model_config):
     instance["pp_size"] = pp_size
     instance["ep_size"] = ep_size
     instance["dp_group"] = dp_group
-    instance["is_moe"] = is_moe
 
     return num_npus, tp_size, pp_size, ep_size, dp_group
 
@@ -148,60 +141,29 @@ def _resolve_dp_groups(all_instances):
         # All members must have same tp_size and ep_size
         tp0 = members[0]["tp_size"]
         ep0 = members[0]["ep_size"]
-        pp0 = members[0]["pp_size"]
         for m in members[1:]:
             if m["tp_size"] != tp0:
                 raise ValueError(f"DP group '{group_name}': tp_size mismatch ({tp0} vs {m['tp_size']})")
             if m["ep_size"] != ep0:
                 raise ValueError(f"DP group '{group_name}': ep_size mismatch ({ep0} vs {m['ep_size']})")
-            if m["pp_size"] != pp0:
-                raise ValueError(f"DP group '{group_name}': pp_size mismatch ({pp0} vs {m['pp_size']})")
 
         dp_size = len(members)
-        if not members[0].get("is_moe", True):
-            # A dense model has no experts, so ``ep_size`` is not a parallelism
-            # degree to spread over the group -- it is 1 because there is
-            # nothing to shard. Dividing it by dp_group_size would reject pure
-            # data parallelism over a dense model, which is what vLLM's
-            # ``--data-parallel-size`` does on its own.
-            ep_total = 1
-            local_ep = 1
-        else:
-            ep_total = ep0  # ep_size in config is the total EP degree across DP group
-            local_ep = ep_total // dp_size
-            if ep_total % dp_size != 0:
-                raise ValueError(f"DP group '{group_name}': ep_size ({ep_total}) not divisible by dp_group_size ({dp_size})")
-            if local_ep > tp0:
-                raise ValueError(f"DP group '{group_name}': local_ep ({local_ep}) > tp_size ({tp0})")
+        ep_total = ep0  # ep_size in config is the total EP degree across DP group
+        local_ep = ep_total // dp_size
+        if ep_total % dp_size != 0:
+            raise ValueError(f"DP group '{group_name}': ep_size ({ep_total}) not divisible by dp_group_size ({dp_size})")
+        if local_ep > tp0:
+            raise ValueError(f"DP group '{group_name}': local_ep ({local_ep}) > tp_size ({tp0})")
 
-        # Topology dimensions for a DP group, innermost first:
-        #   [tp_size] + ([pp_size] if pp > 1) + [dp_group_size]
-        # matching vLLM's rank layout, which is DP x PP x TP with TP contiguous
-        # (``parallel_state.initialize_model_parallel``:
-        # ``all_ranks.reshape(-1, dp, pp, pcp, tp)``).
-        #
-        # Collective scoping follows the groups vLLM builds off that layout:
-        #   TP  ``all_ranks.view(-1, tp)``                    -> the TP dim only.
-        #   EP  ``all_ranks.transpose(1, 2).reshape(-1, dp*pcp*tp)`` -> DP and TP,
-        #       and deliberately **not** PP: the transpose pins the PP index, so
-        #       experts are sharded across the DP x TP ranks of one pipeline
-        #       stage. Marking PP involved would drag the other stages' NPUs into
-        #       a collective they never join in vLLM.
-        has_pp = pp0 > 1
-        if has_pp:
-            tp_dim = [True, False, False]
-            if ep_total <= tp0:
-                ep_dim = [True, False, False]
-            else:
-                ep_dim = [True, False, True] if tp0 > 1 else [False, False, True]
+        # Topology dimensions for DP group: dim 0 = TP (intra-instance), dim 1 = DP (cross-instance)
+        # ALLREDUCE (TP): dim 0 only. ALLTOALL (EP): dim 1 (or both if EP spans TP+DP).
+        tp_dim = [True, False]  # ALLREDUCE on dim 0 only
+        if ep_total <= tp0:
+            # EP fits within TP dimension (no cross-instance ALLTOALL)
+            ep_dim = [True, False]
         else:
-            tp_dim = [True, False]
-            if ep_total <= tp0:
-                # EP fits within TP dimension (no cross-instance ALLTOALL)
-                ep_dim = [True, False]
-            else:
-                # EP spans both dimensions (cross-instance ALLTOALL)
-                ep_dim = [True, True] if tp0 > 1 else [False, True]
+            # EP spans both dimensions (cross-instance ALLTOALL)
+            ep_dim = [True, True] if tp0 > 1 else [False, True]
 
         for m in members:
             m["dp_group_size"] = dp_size
@@ -236,20 +198,11 @@ def _compute_network_dims(instances):
             dp_groups.setdefault(dg, []).append(inst)
 
     if dp_groups:
-        # DP group mode: topology = [tp_size, pp_size, dp_group_size], innermost
-        # first, mirroring vLLM's DP x PP x TP rank layout. pp_size is dropped
-        # when it is 1 so a plain DP+TP config keeps the 2-D topology (and the
-        # collective dim vectors in _resolve_dp_groups keep their 2-element form).
-        #
-        # Leaving pp_size out entirely -- which this did -- sizes the world at
-        # tp * dp while tp * pp * dp NPUs exist, so ASTRA-Sim waits on ranks its
-        # topology has no room for and the run hangs with no error.
-        # All members agree on tp/pp/ep (validated by _resolve_dp_groups).
+        # DP group mode: topology = [tp_size, dp_group_size]
+        # All instances in DP group must have same tp_size (validated by
+        # _resolve_dp_groups).
         first_group = next(iter(dp_groups.values()))
-        tp_size = first_group[0]["tp_size"]
-        pp_size = first_group[0]["pp_size"]
-        dims = ([tp_size, pp_size, len(first_group)] if pp_size > 1
-                else [tp_size, len(first_group)])
+        dims = [first_group[0]["tp_size"], len(first_group)]
     else:
         # Independent instances: standard topology.
         total_npu = sum(
@@ -277,6 +230,42 @@ def _compute_network_dims(instances):
         dims.pop()
     return dims
 
+
+
+def _normalize_network_topologies(raw_value, num_dims, field_name="network_topology"):
+    """Normalize scalar-or-list topology names to one ASTRA-Sim topology per dim."""
+    supported = {"Ring", "Switch", "FullyConnected"}
+
+    if raw_value is None:
+        values = ["FullyConnected"] * num_dims
+    elif isinstance(raw_value, str):
+        values = [raw_value] * num_dims
+    elif isinstance(raw_value, list):
+        if len(raw_value) != num_dims:
+            raise ValueError(
+                f"'{field_name}' must have exactly {num_dims} value(s) to match "
+                f"the ASTRA-Sim topology dimensions, but got {len(raw_value)}."
+            )
+        values = raw_value
+    else:
+        raise TypeError(
+            f"'{field_name}' must be a string or a list of strings, "
+            f"got {type(raw_value).__name__}."
+        )
+
+    normalized = []
+    for value in values:
+        if not isinstance(value, str):
+            raise TypeError(f"'{field_name}' must contain only strings.")
+        value = value.strip()
+        if value not in supported:
+            raise ValueError(
+                f"Unsupported ASTRA-Sim topology '{value}' in '{field_name}'. "
+                f"Supported values are: {', '.join(sorted(supported))}."
+            )
+        normalized.append(value)
+
+    return FlowStyleList(normalized)
 
 def _normalize_network_dim_values(raw_value, num_dims, field_name):
     """Normalize scalar-or-list network settings to one float per topology dim."""
@@ -317,9 +306,12 @@ def _sync_system_collective_dims(system_config_path, instances):
 
 
 # parse cluster configuration from JSON file and build config file for astra-sim
-def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False, enable_attn_offloading=False, inputs_root=None):
+def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False,
+                         enable_attn_offloading=False, inputs_root=None, enable_pim=None):
+    if enable_pim is None:
+        enable_pim = enable_attn_offloading
     cluster_config_path = f'../{cluster_config_path}' # move out from astra-sim folder
-    
+
     try:
         with open(cluster_config_path, 'r') as f:
             cluster_config = json.load(f)
@@ -344,9 +336,13 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
 
     if cluster_config.get("link_bw") is None or cluster_config.get("link_latency") is None:
         raise KeyError("Both 'link_bw' and 'link_latency' must be specified in the cluster configuration.")
-    
+
     link_bw = cluster_config["link_bw"]
     link_latency = cluster_config["link_latency"]
+    network_topology = cluster_config.get(
+        "network_topology",
+        cluster_config.get("topology", "FullyConnected"),
+    )
 
     # Memory required keys
     mem_required_keys = ["mem_size", "mem_bw", "mem_latency"]
@@ -375,7 +371,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         for key in required_keys:
             if key not in node_config:
                 raise KeyError(f"Missing required key '{key}' in node configuration.")
-    
+
     if power_modeling:
         # Check if all required power arguments are present in each node
         required_power_keys = ["base_node_power", "npu", "cpu", "dram", "link", "nic", "storage"]
@@ -401,7 +397,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                         if cpu_key not in power_config["cpu"]:
                             raise KeyError(f"Missing required key '{cpu_key}' in cpu power configuration.")
                 elif key == "dram":
-                    dram_keys = ["dimm_size", "idle_power", "energy_per_bit"] if not enable_attn_offloading else ["energy_per_bit"] # idle_power & dimm_size is not required if pim is enabled
+                    dram_keys = ["dimm_size", "idle_power", "energy_per_bit"] if not enable_pim else ["energy_per_bit"] # idle_power & dimm_size is not required if PIM is enabled
                     for dram_key in dram_keys:
                         if dram_key not in power_config["dram"]:
                             raise KeyError(f"Missing required key '{dram_key}' in dram power configuration.")
@@ -480,10 +476,10 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         cpu_mem = node_config["cpu_mem"]
 
         # overwrite cpu_mem config with pim_config
-        if enable_attn_offloading:
+        if enable_pim:
             # parse pim config
             if "pim_config" not in cpu_mem:
-                raise KeyError("Missing 'pim_config' in 'cpu_mem' configuration while attention offloading is enabled.")
+                raise KeyError("Missing 'pim_config' in 'cpu_mem' configuration while PIM attention or expert offloading is enabled.")
             pim_config_name = cpu_mem["pim_config"]
             pim_config_path = f'../configs/pim/{pim_config_name}.ini'
 
@@ -509,13 +505,13 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             for key in mem_required_keys:
                 if key not in cpu_mem:
                     raise KeyError(f"Missing required key '{key}' in 'cpu_mem' configuration.")
-                
+
         cpu_mem_size.append(cpu_mem["mem_size"])
 
         if power_modeling: # add mem_size (dram size) to power config
             power = node_config["power"]
-            power["dram"]["mem_size"] = cpu_mem["mem_size"] 
-            if enable_attn_offloading:
+            power["dram"]["mem_size"] = cpu_mem["mem_size"]
+            if enable_pim:
                 if 'dimm_size' in power["dram"]:
                     logger.warning(
                     "'dimm_size' in 'dram' power configuration will be overwritten by %s in 'pim_config'.",
@@ -539,10 +535,10 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
                 "num-devices": num_nodes
             }
             # only one type of PIM memory config is supported for now
-            if enable_attn_offloading:
-                memory_config["remote_mem"]["pim-channels"] = cpu_mem["mem_size"] // pim_config["dimm_size"] # one pim channel has one dimm
+            if enable_pim:
+                memory_config["remote_mem"]["pim-channels"] = int(cpu_mem["mem_size"] // pim_config["dimm_size"]) # one pim channel has one dimm
             cpu_mem_enabled = True
-        
+
         # Calculate the total number of NPUs and create a mapping for each instance
         npu_mem_enabled = False  # only one type of npu memory config is supported for now (latency & bandwidth)
 
@@ -555,7 +551,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             for key in mem_required_keys:
                 if key not in npu_mem:
                     raise KeyError(f"Missing required key '{key}' in 'npu_mem' configuration.")
-            
+
             if not npu_mem_enabled:
                 # insert to system configuration
                 with open(system_config_path) as f:
@@ -566,7 +562,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
 
                 with open(system_config_path, "w", encoding="utf-8") as f:
                     json.dump(system_config, f, ensure_ascii=False, indent=2)
-                
+
                 # add memory if local offloading is enabled
                 if enable_local_offloading:
                     memory_config["local_mem"] = {
@@ -582,8 +578,8 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             # instance_id vs idx stands for node-internal instance numbering.
             # For example, 2 node and each node has 2 instances
             # Node 1 -> Instance 0 (idx 0), Instance 1 (idx 1)
-            # Node 2 -> Instance 2 (idx 0), Insatnce 3 (idx 1) 
-            
+            # Node 2 -> Instance 2 (idx 0), Insatnce 3 (idx 1)
+
             # Update inst2npu_mapping
             instance_id = instance.get("instance_id")
             inst2npu_mapping[instance_id] = current_npu_start
@@ -663,7 +659,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             placement.append(inst_placement)
             block_mode_on.append(block_mode)
 
-        
+
         node_id += 1
 
     total_npu = sum(
@@ -680,7 +676,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
     _sync_system_collective_dims(system_config_path, total_instances)
 
     # Generate the final ASTRA-Sim input files after all instances are known.
-    _create_network_config(network_config_path, total_instances, link_bw, link_latency)
+    _create_network_config(network_config_path, total_instances, link_bw, link_latency, network_topology)
     with open(memory_config_path, "w", encoding="utf-8") as f:
         json.dump(memory_config, f, ensure_ascii=False, indent=2)
     _validate_memory_config(memory_config_path, placement, enable_local_offloading)
@@ -706,28 +702,33 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         "pim_models": pim_models,
         "link_bw": link_bw,
         "link_latency": link_latency,
+        "network_topology": network_topology,
         "inputs_root": inputs_root,
         "network_config_path": network_config_path,
         "system_config_path": system_config_path,
         "memory_config_path": memory_config_path,
     }
     # print("Current cluster : {}".format(cluster))
-                
+
     return cluster
 
 # generates topology according to the input arguments
-def _create_network_config(network_config_path, instances, link_bw, link_latency):
+def _create_network_config(network_config_path, instances, link_bw, link_latency, network_topology=None):
     """Create ASTRA-Sim network topology config.
 
     Topology dimensions:
       - For DP groups: [tp_size, dp_group_size] — dim 0 for TP ALLREDUCE, dim 1 for EP ALLTOALL
       - For independent instances: [tp_size, num_groups] — dim 0 for TP, dim 1 for PP/instances
       - Single GPU instances: [1]
+
+    ``network_topology`` may be a scalar topology name broadcast to every
+    dimension or a list with one entry per dimension. Supported topology names
+    are the ASTRA-Sim analytical backend names: Ring, Switch, FullyConnected.
     """
     dims = _compute_network_dims(instances)
     num_dims = len(dims)
     topology_data = {
-        "topology": FlowStyleList(["FullyConnected"] * num_dims),
+        "topology": _normalize_network_topologies(network_topology, num_dims),
         "npus_count": FlowStyleList(dims),
         "bandwidth": _normalize_network_dim_values(link_bw, num_dims, "link_bw"),
         "latency": _normalize_network_dim_values(link_latency, num_dims, "link_latency"),
@@ -795,7 +796,7 @@ def _validate_memory_config(memory_config_path, placement, enable_local_offloadi
 
         for lname, ent in ((inst_placement or {}).get("layer") or {}).items():
             _check_entry(f"layer[{lname}]", ent or {})
-    
+
     return
 
 def get_device(placement, block_idx, layer_name, kind):
@@ -806,7 +807,7 @@ def get_device(placement, block_idx, layer_name, kind):
     # Defensive defaults
     if kind not in {"weights","kv_loc","kv_evict_loc"}:
         raise ValueError(f"Invalid kind '{kind}' for get_device()")
-    
+
     if kind == "kv_evict_loc":
         d = placement["default"][kind]
     else:

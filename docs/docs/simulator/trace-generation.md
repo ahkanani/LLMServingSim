@@ -40,9 +40,7 @@ flowchart LR
     PERSEQ --> EMIT
     SKEWBLEND --> EMIT
     MOE --> EMIT
-    EMIT --> ROWS["TraceData<br/>(field tuple per layer)"]
-    ROWS --> GRAPH["Chakra converter<br/>(in-process)"]
-    ROWS -.->|--save-trace-text| TRACEFILE["trace .txt<br/>(for inspection)"]
+    EMIT --> TRACEFILE["trace .txt<br/>(per layer)"]
 ```
 
 ## The data the simulator consumes
@@ -94,11 +92,8 @@ has its own lookup function:
 | --- | --- | --- | --- |
 | `dense` | `_lookup_dense` | `total_len` (sum of tokens in batch) | 1D linear |
 | `per_sequence` | `_lookup_per_sequence` | `num_requests` | 1D linear |
-| `attention` | `_lookup_attention` | `(prefill_chunk, kv_prefill, n_decode, kv_decode)` | 4D linear (bracket + blend on each axis) |
+| `attention` | `_lookup_attention` | `(prefill_chunk, kv_prefill, n_decode, kv_decode)` | nearest-neighbour on `(pc, n_dec)`, bilinear on `(kv_pre, kv_dec)` |
 | `moe` | `_lookup_moe` | `(local_tokens, activated_experts)` (per rank, profiled at TP=1) | 2D linear |
-
-Every axis is bracketed by its two neighbouring profiled values and
-blended on a linear scale.
 
 All lookups **extrapolate** outside the profiled grid (via linear
 extension), so a runtime value larger than the largest profiled
@@ -141,23 +136,20 @@ costs when a decode batch has non-uniform KV lengths. The plain
 attention grid can't see that, it's profiled with uniform
 `kv_decode` per shot. So the profiler runs a **second sweep** on
 bimodal batches (`skew.csv`) and fits a per-bucket
-**alpha** that says how far along the mean→max line a skewed batch
-lands:
+**alpha** ∈ [0, 1] that says how far along the mean→max line a
+skewed batch lands:
 
 ```
 alpha = (t_skew - t_mean) / (t_max - t_mean)
 ```
 
-At runtime, `_lookup_attention_with_skew` looks the batch up at its
-`kv_decode_mean` and blends toward a second lookup at `kv_decode_max`:
+At runtime, `_lookup_attention_with_skew` does **two** 4D attention
+lookups, one at the batch's `kv_decode_mean`, one at `kv_decode_max`
+- and blends them:
 
 ```
 t_attention = t_mean + alpha * (t_max - t_mean)
 ```
-
-The second lookup only happens when a non-zero alpha applies. A batch
-with one decode, or with every decode at the same length, or resolving
-to `alpha = 0`, returns `t_mean` directly.
 
 The bucket key is built from five axes:
 `pc | n_label | skew_rate_label | kv_big_label | kp_label`
@@ -173,8 +165,7 @@ The bucket axis definitions live in
 lights up finer resolution without any simulator code change.
 
 If the skew sweep wasn't run (`SKIP_SKEW=1` at profile time), the
-simulator applies **no** correction (`alpha = 0`, i.e. `t_mean`).
-Profile skew if you need it. The profile angle
+simulator falls back to a pooled constant alpha. The profile angle
 of skew correction is documented on
 **[Profiler → Skew & alpha fit](/docs/profiler/skew-alpha-fit)**.
 

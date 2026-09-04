@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pim-hot-cold-moe"
+version = "0.1.0"
+description = "MVP foundations for hybrid GPU/PIM MoE simulation"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "pyarrow>=14.0",
+    "PyYAML>=6.0",
+]
+
+[project.scripts]
+pim-hot-cold-moe = "pim_hot_cold_moe.__main__:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]

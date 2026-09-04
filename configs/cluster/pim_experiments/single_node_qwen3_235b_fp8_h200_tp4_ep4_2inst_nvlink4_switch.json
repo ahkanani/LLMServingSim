@@ -1,0 +1,49 @@
+{
+  "num_nodes": 1,
+  "network_topology": ["Switch", "FullyConnected"],
+  "link_bw": [400, 400],
+  "comment": "Two independent Qwen3-235B-A22B-FP8 H200 instances on one 8-GPU node. Topology dims are [4 GPUs per TP/EP-local instance, 2 instance groups]; TP all-reduce and EP all-to-all are scoped to dim0 only, so no cross-instance EP sharing.",
+  "link_latency": [936.25, 50],
+  "nodes": [
+    {
+      "num_instances": 2,
+      "cpu_mem": {
+        "mem_size": 2048,
+        "mem_bw": 256,
+        "mem_latency": 0
+      },
+      "instances": [
+        {
+          "model_name": "Qwen/Qwen3-235B-A22B-FP8",
+          "hardware": "H200",
+          "npu_mem": {
+            "mem_size": 141,
+            "mem_bw": 4800,
+            "mem_latency": 0
+          },
+          "num_npus": 4,
+          "tp_size": 4,
+          "ep_size": 4,
+          "pd_type": null,
+          "dtype": "fp8",
+          "kv_cache_dtype": "fp8"
+        },
+        {
+          "model_name": "Qwen/Qwen3-235B-A22B-FP8",
+          "hardware": "H200",
+          "npu_mem": {
+            "mem_size": 141,
+            "mem_bw": 4800,
+            "mem_latency": 0
+          },
+          "num_npus": 4,
+          "tp_size": 4,
+          "ep_size": 4,
+          "pd_type": null,
+          "dtype": "fp8",
+          "kv_cache_dtype": "fp8"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,142 @@
+[
+  {
+    "index": 1,
+    "config": "001_qwen3_235b_a22b_fp8_chinese_simpleqa_full.yaml",
+    "model": "qwen3_235b_a22b_fp8",
+    "benchmark": "Chinese-SimpleQA",
+    "trace_pack_path": "tracepacks/full/qwen3_235b_a22b_fp8/Chinese-SimpleQA"
+  },
+  {
+    "index": 2,
+    "config": "002_qwen3_235b_a22b_fp8_huggingfaceh4_full.yaml",
+    "model": "qwen3_235b_a22b_fp8",
+    "benchmark": "HuggingFaceH4",
+    "trace_pack_path": "tracepacks/full/qwen3_235b_a22b_fp8/HuggingFaceH4"
+  },
+  {
+    "index": 3,
+    "config": "003_qwen3_235b_a22b_fp8_livecodebench_full.yaml",
+    "model": "qwen3_235b_a22b_fp8",
+    "benchmark": "livecodebench",
+    "trace_pack_path": "tracepacks/full/qwen3_235b_a22b_fp8/livecodebench"
+  },
+  {
+    "index": 4,
+    "config": "004_qwen3_235b_a22b_fp8_mmlu_full.yaml",
+    "model": "qwen3_235b_a22b_fp8",
+    "benchmark": "mmlu",
+    "trace_pack_path": "tracepacks/full/qwen3_235b_a22b_fp8/mmlu"
+  },
+  {
+    "index": 5,
+    "config": "005_qwen3_235b_a22b_fp8_mmlu_zh_cn_full.yaml",
+    "model": "qwen3_235b_a22b_fp8",
+    "benchmark": "mmlu_ZH_CN",
+    "trace_pack_path": "tracepacks/full/qwen3_235b_a22b_fp8/mmlu_ZH_CN"
+  },
+  {
+    "index": 6,
+    "config": "006_deepseek_r1_awq_chinese_simpleqa_full.yaml",
+    "model": "deepseek_r1_awq",
+    "benchmark": "Chinese-SimpleQA",
+    "trace_pack_path": "tracepacks/full/deepseek_r1_awq/Chinese-SimpleQA"
+  },
+  {
+    "index": 7,
+    "config": "007_deepseek_r1_awq_huggingfaceh4_full.yaml",
+    "model": "deepseek_r1_awq",
+    "benchmark": "HuggingFaceH4",
+    "trace_pack_path": "tracepacks/full/deepseek_r1_awq/HuggingFaceH4"
+  },
+  {
+    "index": 8,
+    "config": "008_deepseek_r1_awq_livecodebench_full.yaml",
+    "model": "deepseek_r1_awq",
+    "benchmark": "livecodebench",
+    "trace_pack_path": "tracepacks/full/deepseek_r1_awq/livecodebench"
+  },
+  {
+    "index": 9,
+    "config": "009_deepseek_r1_awq_mmlu_full.yaml",
+    "model": "deepseek_r1_awq",
+    "benchmark": "mmlu",
+    "trace_pack_path": "tracepacks/full/deepseek_r1_awq/mmlu"
+  },
+  {
+    "index": 10,
+    "config": "010_deepseek_r1_awq_mmlu_zh_cn_full.yaml",
+    "model": "deepseek_r1_awq",
+    "benchmark": "mmlu_ZH_CN",
+    "trace_pack_path": "tracepacks/full/deepseek_r1_awq/mmlu_ZH_CN"
+  },
+  {
+    "index": 11,
+    "config": "011_kimi_k2_thinking_chinese_simpleqa_full.yaml",
+    "model": "kimi_k2_thinking",
+    "benchmark": "Chinese-SimpleQA",
+    "trace_pack_path": "tracepacks/full/kimi_k2_thinking/Chinese-SimpleQA"
+  },
+  {
+    "index": 12,
+    "config": "012_kimi_k2_thinking_huggingfaceh4_full.yaml",
+    "model": "kimi_k2_thinking",
+    "benchmark": "HuggingFaceH4",
+    "trace_pack_path": "tracepacks/full/kimi_k2_thinking/HuggingFaceH4"
+  },
+  {
+    "index": 13,
+    "config": "013_kimi_k2_thinking_livecodebench_full.yaml",
+    "model": "kimi_k2_thinking",
+    "benchmark": "livecodebench",
+    "trace_pack_path": "tracepacks/full/kimi_k2_thinking/livecodebench"
+  },
+  {
+    "index": 14,
+    "config": "014_kimi_k2_thinking_mmlu_full.yaml",
+    "model": "kimi_k2_thinking",
+    "benchmark": "mmlu",
+    "trace_pack_path": "tracepacks/full/kimi_k2_thinking/mmlu"
+  },
+  {
+    "index": 15,
+    "config": "015_kimi_k2_thinking_mmlu_zh_cn_full.yaml",
+    "model": "kimi_k2_thinking",
+    "benchmark": "mmlu_ZH_CN",
+    "trace_pack_path": "tracepacks/full/kimi_k2_thinking/mmlu_ZH_CN"
+  },
+  {
+    "index": 16,
+    "config": "016_llama_4_maverick_17b_128e_instruct_huggingfaceh4_full.yaml",
+    "model": "llama_4_maverick_17b_128e_instruct",
+    "benchmark": "HuggingFaceH4",
+    "trace_pack_path": "tracepacks/full/llama_4_maverick_17b_128e_instruct/HuggingFaceH4"
+  },
+  {
+    "index": 17,
+    "config": "017_llama_4_maverick_17b_128e_instruct_hellaswag_full.yaml",
+    "model": "llama_4_maverick_17b_128e_instruct",
+    "benchmark": "hellaswag",
+    "trace_pack_path": "tracepacks/full/llama_4_maverick_17b_128e_instruct/hellaswag"
+  },
+  {
+    "index": 18,
+    "config": "018_llama_4_maverick_17b_128e_instruct_livecodebench_full.yaml",
+    "model": "llama_4_maverick_17b_128e_instruct",
+    "benchmark": "livecodebench",
+    "trace_pack_path": "tracepacks/full/llama_4_maverick_17b_128e_instruct/livecodebench"
+  },
+  {
+    "index": 19,
+    "config": "019_llama_4_maverick_17b_128e_instruct_mmlu_full.yaml",
+    "model": "llama_4_maverick_17b_128e_instruct",
+    "benchmark": "mmlu",
+    "trace_pack_path": "tracepacks/full/llama_4_maverick_17b_128e_instruct/mmlu"
+  },
+  {
+    "index": 20,
+    "config": "020_llama_4_maverick_17b_128e_instruct_mmlu_zh_cn_full.yaml",
+    "model": "llama_4_maverick_17b_128e_instruct",
+    "benchmark": "mmlu_ZH_CN",
+    "trace_pack_path": "tracepacks/full/llama_4_maverick_17b_128e_instruct/mmlu_ZH_CN"
+  }
+]

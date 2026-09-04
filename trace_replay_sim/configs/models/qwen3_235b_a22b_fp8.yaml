@@ -1,0 +1,15 @@
+model:
+  model_id: Qwen/Qwen3-235B-A22B-FP8
+  short_name: qwen3_235b_a22b_fp8
+  family: Qwen3-235B
+  num_layers: 94
+  experts_per_layer: 128
+  top_k: 8
+  expert_weight_bytes: 18874368
+  metadata:
+    hidden_size: 4096
+    moe_intermediate_size: 1536
+    weight_dtype: fp8_assumed
+    expert_weight_formula: 3 * hidden_size * moe_intermediate_size * 1 byte
+    source_config: https://huggingface.co/Qwen/Qwen3-235B-A22B-FP8/blob/main/config.json
+    source_trace_pack: tracepacks/full/qwen3_235b_a22b_fp8/mmlu/manifest.json

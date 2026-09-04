@@ -1,0 +1,34 @@
+trace:
+  trace_pack_path: tracepacks/full/kimi_k2_thinking/mmlu_ZH_CN
+  benchmark: mmlu_ZH_CN
+model:
+  config_path: ../../../models/kimi_k2_thinking.yaml
+hardware:
+  config_path: ../../../hardware/8gpu_h200_remote_mem_bw09.yaml
+replay:
+  seed: 123
+  max_batch_size: 128
+  warmup_steps: 16
+  eval_steps: 5000
+run:
+  seed: 123
+  output_dir: runs/remote_mem/full_runs
+  run_id: remote_mem_kimi_k2_thinking_mmlu_zh_cn_static_hot_cold_bw09
+  overwrite: false
+predictor:
+  type: heuristic
+  horizon: 1
+  window_size: 128
+  decay: 0.95
+  use_prefill_context: false
+placement:
+  mode: static_hot_cold
+  hot_fraction: 0.5
+  cold_fraction: 0.25
+  warmup_weight: 1.0
+  prediction_weight: 1.0
+scheduler:
+  policy: placement_greedy
+  oracle_comparison: true
+metrics:
+  level: summary

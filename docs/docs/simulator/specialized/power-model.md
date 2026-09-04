@@ -45,12 +45,8 @@ total_energy += ΔE
 The trick is **per-component tracking**. NPU power depends on
 whether it's actively running a kernel (active_power), recently
 finished (standby_power for `standby_duration` ns, then back to
-idle), or idle. There is no stored `last_compute_end_ns` field: the
-trace generator passes the boundaries in per call, as
-`add_npu_standby_energy_consumption(hardware, node_id, current_ns,
-last_end_ns, last_calc_ns, num_npus)`, and the model derives the
-standby window from `current_ns - last_end_ns` against that hardware's
-configured `standby_duration`, clamping to zero once it is spent.
+idle), or idle. The model tracks `last_compute_end_ns` per NPU and
+applies the right wattage based on `current_ns - last_compute_end_ns`.
 
 CPU, DRAM, link, NIC, storage are simpler: each has a constant
 background draw plus a per-event energy increment for traffic /
@@ -90,18 +86,16 @@ state workloads where the NPU is more or less always busy.
 
 ### Periodic throughput log
 
-Every `--log-interval` simulated seconds, the heartbeat block gains a
-final branch:
+Every `--log-interval` seconds, the throughput log line gains a
+`power=` field:
 
-```text
-        └─Avg power consumption: 712.4 W
+```
+[INFO] step=42 batch=8 prompt_t=1.2k tok/s decode_t=420 tok/s
+       npu_mem=88.4 GB power=712 W
 ```
 
-Despite reading like a snapshot, this is the **interval average**:
-`get_current_power()` takes the energy accrued since the previous
-heartbeat and divides by the elapsed simulated time. It also sums
-across **every node** into one scalar, so it is a cluster figure, not a
-per-node one.
+`power` is the **current** total system power, the sum of every
+component's instantaneous wattage at this moment.
 
 ### Final summary
 
@@ -128,12 +122,14 @@ see which components dominate.
 ## Multi-node power
 
 Each node has its own `power:` block. The simulator runs all node
-power models in parallel, but the heartbeat still prints **one**
-aggregated number — `get_current_power()` accumulates across nodes
-before returning. Per-node attribution is available only in the final
-summary, which prints a `Node <i> total energy consumption (kJ)` block
-per node with a per-device breakdown under it, plus the cluster total
-and the full per-interval power series.
+power models in parallel and the throughput log line shows them
+together:
+
+```
+       power=[node0=712 W, node1=689 W]
+```
+
+The final summary prints a per-node breakdown plus a cluster total.
 
 ## Where the per-NPU active power comes from
 

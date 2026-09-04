@@ -11,8 +11,9 @@ import subprocess
 import argparse
 import json
 import shutil
+import copy
 from time import time
-from collections import defaultdict, deque
+from collections import defaultdict
 
 from serving.core.scheduler import *
 from serving.core.request import *
@@ -27,6 +28,7 @@ from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
+from serving.core.expert_offload import ExpertOffloadConfig
 import sys as flush
 
 from pyinstrument import Profiler
@@ -60,33 +62,6 @@ def _pad_batch_to_max(batch, max_len):
     batch.total_len = max_len
     batch.kv_len += pad                  # each dummy contributes kv=1
     batch.num_decode += pad              # counted for lm_head / dense shape
-
-
-def _pass_response(router, current, state_changed=False):
-    """The "pass" answer, carrying the next known arrival when there is one.
-
-    ASTRA-Sim stops re-asking an NPU that passed until either some NPU
-    reports an iteration the frontend has not processed yet, or this
-    deadline is reached. Those are the only two things that can change what
-    ``schedule()`` returns, so suppressing the re-asks in between skips no
-    decision. Without the deadline an idle instance would stay suppressed
-    past an arrival it should have admitted, in the case where every other
-    instance is still mid-batch and so no report is coming.
-
-``state_changed=True`` sends ``pass -1``: this pass altered scheduler
-    state, so it is not idempotent and re-asking is not a wasted question.
-    The three DP-barrier passes do that -- joining a round with a dummy,
-    joining it with a real batch, or handing a batch claim back -- and none
-    of them is preceded by a report, so nothing else would lift the
-    suppression. ASTRA-Sim treats it like a workload assignment: this NPU
-    stays askable and every other one is re-opened too.
-    """
-    if state_changed:
-        return "pass -1"
-    nxt = router.get_next_pending_arrival()
-    if nxt is None or nxt <= current:
-        return "pass"
-    return f"pass {int(nxt)}"
 
 
 def _runtime_limit(value):
@@ -178,29 +153,6 @@ def _resolve_instance_dtype(instance, cli_dtype, dtype_to_bits):
     return dtype
 
 
-def _resolve_mem_util(instance, cli_default):
-    """Per-instance NPU memory utilization, from ``npu_mem.mem_util``.
-
-    Lives inside ``npu_mem`` because its only job is to scale ``mem_size``, and
-    it follows that block's ``mem_*`` naming. Falls back to the CLI default.
-    """
-    util = instance.get("npu_mem", {}).get("mem_util", cli_default)
-    try:
-        util = float(util)
-    except (TypeError, ValueError):
-        raise ValueError(
-            f"npu_mem.mem_util for instance {instance.get('instance_id')} must be a "
-            f"number in (0, 1]; got {util!r}"
-        ) from None
-    if not 0 < util <= 1:
-        raise ValueError(
-            f"npu_mem.mem_util for instance {instance.get('instance_id')} must be in "
-            f"(0, 1]; got {util}. It is a fraction of npu_mem.mem_size, so 0.9 rather "
-            f"than 90"
-        )
-    return util
-
-
 def _build_instance_runtime_configs(instances, args, dtype_to_bits):
     runtime_configs = []
     for instance_id, instance in enumerate(instances):
@@ -210,17 +162,25 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             raise ValueError(f"Unsupported kv_cache_dtype '{kv_cache_dtype}' for instance {instance_id}")
 
         enable_attn_offloading = instance.get("enable_attn_offloading", args.enable_attn_offloading)
+        enable_expert_offloading = instance.get(
+            "enable_expert_offloading", args.enable_expert_offloading)
+        expert_offload = dict(instance.get("expert_offload", {}) or {})
+        expert_routing_distribution_csv = expert_offload.get("routing_distribution_csv")
+        if expert_routing_distribution_csv is None:
+            expert_routing_distribution_csv = instance.get(
+                "expert_routing_distribution_csv", args.expert_routing_distribution_csv)
+        if expert_routing_distribution_csv is not None:
+            expert_offload.setdefault(
+                "routing_distribution_csv", expert_routing_distribution_csv)
+        expert_offload_config = ExpertOffloadConfig.from_dict(
+            expert_offload,
+            enabled=enable_expert_offloading,
+        )
         enable_sub_batch_interleaving = instance.get(
             "enable_sub_batch_interleaving", args.enable_sub_batch_interleaving)
         if enable_sub_batch_interleaving and not enable_attn_offloading:
             raise RuntimeError(
                 f"Instance {instance_id} enables sub-batch interleaving without attention offloading")
-        if enable_sub_batch_interleaving and instance.get("pp_size", 1) > 1:
-            raise RuntimeError(
-                f"Instance {instance_id} enables sub-batch interleaving with pp_size "
-                f"{instance['pp_size']}: an interleaved trace leaves both sub-batches "
-                f"mid-block at every group edge, so a pipeline stage has no single "
-                f"hidden state to pass on")
 
         runtime_configs.append({
             "max_num_seqs": _runtime_limit(instance.get("max_num_seqs", args.max_num_seqs)),
@@ -236,12 +196,14 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
                 "enable_chunked_prefill", args.enable_chunked_prefill),
             "enable_prefix_caching": instance.get(
                 "enable_prefix_caching", args.enable_prefix_caching),
-            "npu_memory_utilization": _resolve_mem_util(
-                instance, args.npu_memory_utilization),
-            "reserve_full_isl": instance.get("reserve_full_isl", args.reserve_full_isl),
+            "prioritize_prefill": instance.get("prioritize_prefill", args.prioritize_prefill),
             "enable_local_offloading": instance.get(
                 "enable_local_offloading", args.enable_local_offloading),
             "enable_attn_offloading": enable_attn_offloading,
+            "enable_expert_offloading": enable_expert_offloading,
+            "expert_offload": expert_offload,
+            "expert_offload_config": expert_offload_config,
+            "expert_routing_distribution_csv": expert_routing_distribution_csv,
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
         })
@@ -258,8 +220,8 @@ def main():
 
     # -------------------------------------- Argument parsing --------------------------------------
     parser = argparse.ArgumentParser(prog='python -m serving',
-                                     description='LLMServingSim') 
-    
+                                     description='LLMServingSim')
+
     parser.add_argument('--cluster-config', type=str, default='configs/cluster/single_node_single_instance.json',
                         help='path to cluster config JSON defining node topology, instance layout, hardware, and memory hierarchy')
     parser.add_argument('--max-num-seqs', type=int, default=128,
@@ -288,17 +250,19 @@ def main():
                         'a trained load-balanced learned gate), '
                         'RR (round-robin), RAND (uniform random per token), '
                         'CUSTOM (user-defined)')
+    parser.add_argument('--expert-routing-distribution-csv', type=str, default=None,
+                        help='path to a CSV describing a custom per-expert routing distribution. '
+                        'Used when --expert-routing-policy CUSTOM is selected')
     parser.add_argument('--enable-block-copy', action=argparse.BooleanOptionalAction,
                         default=True,
                         help='Replay one transformer block\'s trace across every '
                         'layer instead of re-computing the routing per layer — '
                         'cuts trace-generation time roughly num_hidden_layers× '
-                        'on MoE models. Safe with BALANCED (deterministic); '
-                        'RR/RAND get a small per-layer variance averaged out. '
-                        'Disable only for CUSTOM policies that need faithful '
-                        'per-layer variance.')
+                        'on MoE models. Safe with layer-invariant routing; '
+                        'CUSTOM distributions with layer-specific rows disable '
+                        'this automatically.')
     parser.add_argument('--enable-prefix-caching', action=argparse.BooleanOptionalAction, default=True,
-                        help='enable prefix caching to reuse KV cache blocks across requests '
+                        help='enable prefix caching via RadixAttention to reuse KV cache across requests '
                         'with shared prefixes (default: enabled). Use --no-enable-prefix-caching to disable')
     parser.add_argument('--enable-chunked-prefill', action=argparse.BooleanOptionalAction, default=True,
                         help='enable chunked prefill to split long prefill requests across multiple iterations, '
@@ -312,22 +276,14 @@ def main():
                         'Recommended to disable unless weight memory access is not counted in profiling')
     parser.add_argument('--enable-attn-offloading', action='store_true', default=False,
                         help='enable attention computation offloading to PIM (Processing-In-Memory) devices')
+    parser.add_argument('--enable-expert-offloading', action='store_true', default=False,
+                        help='enable static MoE expert offloading to PIM. '
+                        'prepares PIM memory for future expert offload trace generation')
     parser.add_argument('--enable-sub-batch-interleaving', action='store_true', default=False,
                         help='enable sub-batch interleaving to overlap XPU and PIM computation. '
                         'Requires --enable-attn-offloading')
-    parser.add_argument('--reserve-full-isl', action=argparse.BooleanOptionalAction, default=True,
-                        help='admit a request only if its whole sequence fits in the KV cache, '
-                        'not merely its first chunk. Mirrors vLLM\'s scheduler_reserve_full_isl '
-                        '(True there too); without it chunked prefill over-admits and thrashes '
-                        'the KV cache. Override per instance with "reserve_full_isl"')
-    parser.add_argument('--npu-memory-utilization', type=float, default=0.9,
-                        help='fraction of NPU memory an instance may use for weights plus '
-                        "KV cache. Corresponds to vLLM's --gpu-memory-utilization, renamed "
-                        'because every other memory surface here is NPU-terminology; '
-                        'override per instance with "npu_mem": {"mem_util": ...}. KV capacity is '
-                        '(npu_mem * this - model weight); the activation peak and CUDA '
-                        'context that vLLM also subtracts are not modelled, so the '
-                        'resulting capacity is an upper bound on vLLM\'s at the same value')
+    parser.add_argument('--prioritize-prefill', action='store_true', default=False,
+                        help='prioritize prefill requests over decode requests in scheduling')
     parser.add_argument('--block-size', type=int, default=16,
                         help='KV cache block size in tokens (number of tokens per block)')
     parser.add_argument('--dataset', type=str, default=None,
@@ -342,19 +298,10 @@ def main():
     parser.add_argument('--inputs-root', type=str, default=None,
                         help='override the root directory for generated ASTRA-Sim inputs. Defaults to '
                         'astra-sim/inputs/runs/<run-id>')
-    parser.add_argument('--save-trace-text', action=argparse.BooleanOptionalAction, default=False,
-                        help='write each batch\'s trace as text, for inspection (default: '
-                        'disabled). Nothing in the pipeline reads it -- the Chakra converter takes '
-                        'the trace rows directly -- so it is produced only on request, and it is '
-                        'the only human-readable form of what the simulator emitted. Implies '
-                        '--keep-inputs, since the text is written into the run directory. Can '
-                        'leave gigabytes behind on a long run')
-    parser.add_argument('--keep-inputs', action=argparse.BooleanOptionalAction, default=False,
-                        help='keep the generated ASTRA-Sim inputs under '
-                        'astra-sim/inputs/runs/<run-id> after a successful simulation (default: '
-                        'disabled). Preserves the Chakra .et workloads and the generated network, '
-                        'system and memory configs, so a run can be replayed through ASTRA-Sim by '
-                        'hand. Replaces --cleanup-inputs, whose polarity was inverted')
+    parser.add_argument('--cleanup-inputs', action=argparse.BooleanOptionalAction, default=True,
+                        help='remove generated ASTRA-Sim inputs under astra-sim/inputs/runs/<run-id> '
+                        'after a successful simulation (default: enabled). Use --no-cleanup-inputs '
+                        'to preserve generated trace files, Chakra workloads, and input configs for debugging')
     parser.add_argument('--skip-prefill', action='store_true', default=False,
                         help='skip the prefill phase, running decode only')
     parser.add_argument('--num-reqs', type=int, default=0,
@@ -366,14 +313,12 @@ def main():
     parser.add_argument('--log-level', type=str, choices=['WARNING', 'INFO', 'DEBUG'], default='WARNING',
                         help='logging verbosity: WARNING (minimal), INFO (per-iteration details), DEBUG (per-layer memory)')
     parser.add_argument('--kv-cache-dtype', type=str, choices=['auto', 'fp8'], default='auto',
-                        help='KV cache data type: auto (inherit --dtype) or fp8. Selects the profile '
-                        'variant folder -- fp8 resolves to <dtype>-kvfp8, e.g. bf16-kvfp8 -- and '
-                        'halves KV cache memory. Override per instance with "kv_cache_dtype"')
+                        help='KV cache data type: auto (use default profile.csv) or fp8 (use profile_fp8.csv, halves KV cache memory)')
     parser.add_argument('--network-backend', type=str, choices=['analytical', 'ns3'], default='analytical',
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
 
     args = parser.parse_args()
-    
+
     args.run_id = resolve_run_id(args.run_id)
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
@@ -383,8 +328,9 @@ def main():
     logger = get_logger("Main")
     print_banner()
     print_input_config(args=args)
+    print_markup("[sim.heading]▶ Starting simulation...[/]\n")
     flush.stdout.flush()
-    
+
     _dtype_to_bits = {'float16': 16, 'bfloat16': 16, 'float32': 32, 'fp8': 8, 'int8': 8}
     request_routing_policy=args.request_routing_policy
     expert_routing_policy=args.expert_routing_policy
@@ -402,27 +348,31 @@ def main():
         inst.get("enable_local_offloading", False) for inst in raw_instances)
     build_enable_attn_offloading = args.enable_attn_offloading or any(
         inst.get("enable_attn_offloading", False) for inst in raw_instances)
+    build_enable_expert_offloading = args.enable_expert_offloading or any(
+        inst.get("enable_expert_offloading", False) for inst in raw_instances)
+    build_enable_pim = build_enable_attn_offloading or build_enable_expert_offloading
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(
         astra_sim, args.cluster_config, build_enable_local_offloading, build_enable_attn_offloading,
-        inputs_root=run_paths.inputs_root)
+        inputs_root=run_paths.inputs_root, enable_pim=build_enable_pim)
+    trace_cluster = copy.deepcopy(cluster)
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
-    instances = cluster["instances"]
-    inst2node_mapping = cluster["inst2node_mapping"]
-    inst2npu_mapping = cluster["inst2npu_mapping"]
-    npu2inst_mapping = cluster["npu2inst_mapping"]
-    prefill_instance = cluster["prefill_instance"]
-    decode_instance = cluster["decode_instance"]
-    start_npu_ids = cluster["start_npu_ids"]
-    end_npu_ids = cluster["end_npu_ids"]
-    placement = cluster["placement"]
-    block_mode_on = cluster["block_mode_on"]
+    instances = trace_cluster["instances"]
+    inst2node_mapping = trace_cluster["inst2node_mapping"]
+    inst2npu_mapping = trace_cluster["inst2npu_mapping"]
+    npu2inst_mapping = trace_cluster["npu2inst_mapping"]
+    prefill_instance = trace_cluster["prefill_instance"]
+    decode_instance = trace_cluster["decode_instance"]
+    start_npu_ids = trace_cluster["start_npu_ids"]
+    end_npu_ids = trace_cluster["end_npu_ids"]
+    placement = trace_cluster["placement"]
+    block_mode_on = trace_cluster["block_mode_on"]
     total_npu = cluster["total_npu"]
     cpu_mem_size = cluster["cpu_mem_size"]
     power_modeling = cluster["power_modeling"]
-    power_configs = cluster["power_configs"]
-    pim_models = cluster["pim_models"]
+    power_configs = trace_cluster["power_configs"]
+    pim_models = trace_cluster["pim_models"]
     instance_runtime_configs = _build_instance_runtime_configs(instances, args, _dtype_to_bits)
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
     # ----------------------------------------- Set config -----------------------------------------
@@ -439,7 +389,7 @@ def main():
     memory=run_paths.memory_config
     system=run_paths.system_config
     # ------------------------------------- Prepare simulation -------------------------------------
-    # Need to extract each instance's memory accessability 
+    # Need to extract each instance's memory accessability
     node2inst_mapping = defaultdict(list)
     for inst_id, node_id in inst2node_mapping.items():
         node2inst_mapping[node_id].append(inst_id)
@@ -480,34 +430,36 @@ def main():
             cfg = instance_runtime_configs[inst_ids[0]]
             return full_cluster_kv_bytes_per_token(model, cfg["fp"], cfg["kv_cache_dtype"])
 
-        def _pool_block_size(inst_ids):
-            sizes = {instance_runtime_configs[i]["block_size"] for i in inst_ids}
-            if len(sizes) > 1:
-                raise RuntimeError(
-                    f"Shared prefix pool requires instances to share block_size; got {sizes}")
-            return sizes.pop()
-
         if prefix_storage == 'CPU':
             for i in range(num_prefix_pool):
-                if cpu_mem_size[i] <= 0:
+                if cpu_mem_size[i] > 0:
+                    new_prefix_pool = RadixCache(
+                                                node_id=0,
+                                                device=prefix_storage,
+                                                page_size=256,
+                                                capacity = cpu_mem_size[i] * GB_TO_BYTE,
+                                                kv_size=_pool_kv_bytes_per_token(node2inst_mapping[i]),
+                                                enable_kv_cache_events=True)
+                    prefix_pools.append(new_prefix_pool)
+                else:
                     raise RuntimeError(f"Memory size for prefix storage type {prefix_storage} is invalid")
-                inst_ids = node2inst_mapping[i]
-                prefix_pools.append(build_prefix_pool(
-                    pool_device, cpu_mem_size[i] * GB_TO_BYTE,
-                    _pool_block_size(inst_ids), _pool_kv_bytes_per_token(inst_ids),
-                    node_id=i))
             # This means one node shares one prefix pool
             prefix_pool_inst_mapping = inst2node_mapping
 
         elif prefix_storage == 'CXL':
-            if cluster["cxl_mem_size"] <= 0:
+            if cluster["cxl_mem_size"] > 0:
+                new_prefix_pool = RadixCache(
+                                            node_id=None,
+                                            device=prefix_storage,
+                                            page_size=1,
+                                            capacity = cluster["cxl_mem_size"] * GB_TO_BYTE,
+                                            kv_size=_pool_kv_bytes_per_token(list(range(num_instances))),
+                                            enable_kv_cache_events=True)
+                prefix_pools.append(new_prefix_pool)
+                # This means every instance shares the same universal prefix pool (maybe fixed later)
+                prefix_pool_inst_mapping = [0 for _ in range(num_instances)]
+            else:
                 raise RuntimeError(f"Memory size for prefix storage type {prefix_storage} is invalid")
-            inst_ids = list(range(num_instances))
-            prefix_pools.append(build_prefix_pool(
-                pool_device, cluster["cxl_mem_size"] * GB_TO_BYTE,
-                _pool_block_size(inst_ids), _pool_kv_bytes_per_token(inst_ids)))
-            # This means every instance shares the same universal prefix pool (maybe fixed later)
-            prefix_pool_inst_mapping = [0 for _ in range(num_instances)]
         else:
             raise NotImplementedError(f"Prefix storage type {prefix_storage} is not supported or memory size is invalid")
 
@@ -519,8 +471,8 @@ def main():
             prefix_pool = prefix_pools[prefix_pool_index]
         cxl_mem = 0
         if cluster["cxl_mem_size"] > 0:
-            cxl_mem = cluster["cxl_mem_size"]        
-        
+            cxl_mem = cluster["cxl_mem_size"]
+
         # Make scheduler for each instance
 
         inst_cfg = instance_runtime_configs[instance_id]
@@ -532,34 +484,13 @@ def main():
             instance["npu_mem"]["mem_size"], cpu_mem_size[instance["node_id"]],
             inst2npu_mapping[instance_id], instance["pd_type"],
             inst_cfg["fp"], inst_cfg["block_size"], num_req,
-            inst_cfg["enable_prefix_caching"],
+            inst_cfg["prioritize_prefill"], inst_cfg["enable_prefix_caching"],
             enable_prefix_sharing, prefix_pool, pool_device, inst_cfg["enable_chunked_prefill"],
             inst_cfg["long_prefill_token_threshold"],
             cxl_mem,
             ep_size=instance.get("ep_total", 1),
             kv_cache_dtype=inst_cfg["kv_cache_dtype"],
-            npu_memory_utilization=inst_cfg["npu_memory_utilization"],
-            reserve_full_isl=inst_cfg["reserve_full_isl"],
         ))
-
-    # The derived KV capacity, not the utilization fraction, is what decides
-    # memory pressure. It is per instance and only known once the schedulers
-    # exist, so it gets its own section rather than a row in the input-config
-    # block, which is printed before any of this is resolved.
-    print_heading("KV Cache Initialization")
-    print_markup("")
-    # Pad only as far as the widest label, so the line stays inside the rule.
-    pad = max(len(f"Instance [{i}]") for i in range(len(schedulers)))
-    for inst_id, sched in enumerate(schedulers):
-        pool = sched.memory.npu_pool
-        label = f"Instance \\[{inst_id}]"
-        print_markup(
-            f"  \u2022 [cyan]{label:<{pad + 1}}[/cyan] : "
-            f"{pool.num_blocks * pool.block_size} tokens / {pool.num_blocks} blocks "
-            f"({pool.num_blocks * pool.bytes_per_block / GB_TO_BYTE:.2f} GiB/rank "
-            f"at util {sched.memory.npu_memory_utilization:.2f})"
-        )
-    print_rule()
 
     # Controller for astra-sim process communication
     controller = Controller(total_npu)
@@ -598,10 +529,7 @@ def main():
     last_log = 0    # last logged time
     FREQ = 1000_000_000 # 1 GHz (1e9 Hz)
     INTERVAL = log_interval*FREQ
-    # Per-interval token counts -> tokens/s, so 1/log_interval. Floor division
-    # collapsed to 0 for any --log-interval > 1, which zeroed every logged
-    # throughput and made the summary line divide by zero.
-    RATIO = FREQ/INTERVAL
+    RATIO = FREQ//INTERVAL
     total_prompt = 0
     total_gen = 0
     total_latency = 0
@@ -613,10 +541,10 @@ def main():
         event_time = first_arival_time
     else:
         event_time = INTERVAL
-    event_trace = generate_event(int(event_time), inputs_root=run_paths.inputs_root)
+    generate_event(int(event_time), inputs_root=run_paths.inputs_root)
     # Make Chakra Grapth
     generate_graph(None, None, total_npu, event=True, inputs_root=run_paths.inputs_root,
-                   save_trace_text=args.save_trace_text, trace=event_trace)
+                   cleanup_trace=args.cleanup_inputs)
     # set first workload file
     workload = get_workload(None, None, event=True, inputs_root=run_paths.inputs_root)
     # run subprocess
@@ -641,29 +569,18 @@ def main():
     for dg, members in dp_groups.items():
         for inst_id in members:
             inst_dp_group[inst_id] = dg
-    # Batches waiting at the DP barrier: per group, per member, a FIFO. With
-    # pp_size > 1 a member can have up to pp_size batches awaiting their round,
-    # and vLLM pairs the members' forwards in order -- rank A's j-th forward
-    # joins the same collective as rank B's j-th. A single slot per member
-    # silently dropped the earlier batch, which then never got a workload_name,
-    # so the instance's other NPUs retried joining it forever.
-    dp_pending = {dg: defaultdict(deque) for dg in dp_groups}  # dg -> {inst: deque[(batch, node_id)]}
-    # Workloads pre-generated by a DP round, keyed by the NPU that opened that
-    # member's batch, i.e. the one that owes ASTRA-Sim its graph. A FIFO because
-    # with pp_size > 1 an NPU can open a second round before it has been handed
-    # the first one's graph, and a single slot silently dropped the first.
-    dp_ready_workloads = defaultdict(deque)  # npu_id -> deque[workload_path]
+    # Pending batches per DP group (waiting for all members to schedule)
+    dp_pending = {dg: {} for dg in dp_groups}  # dp_group -> {instance_id: (new_req, sys)}
+    # Pre-generated workloads ready to submit on next "Waiting"
+    dp_ready_workloads = {}  # start_npu_id -> workload_path for DP peer start ranks
 
     # ----------------------------------- Start simulation loop ------------------------------------
-    print_markup("[sim.heading]▶ Starting simulation...[/]\n")
-    flush.stdout.flush()
-
     # Starting simulation, one while loop processes one iteration
     while True:
-        
+
         out = controller.read_wait(p)
         out_dict = controller.parse_output(out[-2])
-        
+
         if out_dict != None:
             sys = out_dict['sys']
             id = out_dict['id']
@@ -708,50 +625,18 @@ def main():
         if instances[instance_id]["pd_type"] == "prefill" and len(finished_reqs) > 0:
             router.transfer_prefill_request(finished_reqs)
 
-        # An NPU that opened a DP round owes ASTRA-Sim that round's graph, and it
-        # has to be handed over before the scheduler may open anything new. vLLM
-        # schedules and dispatches in one step (``schedule()`` then
-        # ``execute_model()`` inside ``step_with_batch_queue``), so a scheduled
-        # batch is never left un-dispatched. A DP batch has to break that up --
-        # its graph cannot be emitted until every member has joined the barrier
-        # and the padded ``max_total_len`` is known -- so the invariant to keep is
-        # that the dispatch still lands before the next schedule for this NPU.
-        # Without it, at pp_size > 1 the NPU built its next microbatch on the very
-        # poll that should have handed over the previous one, and the round after
-        # that overwrote the entry: the first graph never ran, and the other
-        # pipeline stage blocked forever on a RECV that never came.
-        pending = dp_ready_workloads.get(sys)
-        new_req = None if pending else schedulers[instance_id].schedule(current, sys, id)
+        # schedule requests
+        new_req = schedulers[instance_id].schedule(current, sys, id)
         responded = False  # track whether we already sent a response to ASTRA-Sim
 
-        # Hand over a workload pre-generated by a DP round this NPU opened.
-        if pending:
-            controller.write_flush(p, pending.popleft())
-            if not pending:
-                del dp_ready_workloads[sys]
+        # Check if a pre-generated workload is ready for this instance (from DP sync)
+        if new_req is None and sys in dp_ready_workloads:
+            controller.write_flush(p, dp_ready_workloads.pop(sys))
             responded = True
         # DP group: truly idle instance (no inflight batch) — create dummy batch so ALLTOALL syncs
-        # An idle DP member has to keep pace with a busy one. vLLM requires every
-        # rank of a DP group to run the same number of forwards, and with PP a
-        # rank has pp_size microbatches in flight at once -- so the gate here is
-        # schedule()'s own pipeline-depth rule, not "nothing in flight". Gating on
-        # == 0 lets the member holding the real request run ahead by up to
-        # pp_size batches, and the dp_pending barrier then waits for a round the
-        # idle members can never join.
-        #
-        # Any NPU of the instance may open the round, not just its first. Which
-        # NPU ASTRA-Sim asks about is not ours to choose, and an instance whose
-        # start NPU is busy or starved would otherwise never contribute a dummy
-        # -- the barrier then waits on a member that cannot answer. An empty
-        # ``dp_pending[dg][instance_id]`` keeps it to one dummy per member per
-        # round -- the member has nothing queued, so it has not yet joined the
-        # round being assembled -- which is what the start-NPU test used to be
-        # standing in for.
-        elif (new_req is None and instance_id in inst_dp_group
-              and not dp_pending[inst_dp_group[instance_id]][instance_id]
-              and len(schedulers[instance_id].inflight) < schedulers[instance_id].pp_size):
+        elif new_req is None and instance_id in inst_dp_group and sys == inst2npu_mapping[instance_id] and len(schedulers[instance_id].inflight) == 0:
             dg = inst_dp_group[instance_id]
-            if any(dp_pending[dg][i] for i in dp_groups[dg]):
+            if dp_pending[dg]:
                 # Emit a 1-token dummy; the uniform pad-to-max pass below
                 # brings it (and any undersized real peers) up to the
                 # group's max_total_len, matching vLLM's CUDA-graph DP padding.
@@ -759,25 +644,15 @@ def main():
                 dummy = Batch(schedulers[instance_id].get_batch_id(), instances[instance_id]["model_name"],
                               1, 1, [1], [], 0, 1, [], [], [1], current, 0)
                 dummy.fired.append(sys)
-                # Register it the way scheduler._build_batch registers a real
-                # batch. Without this the instance's other NPUs get nothing:
-                # schedule() routes them to _schedule_existing, which searches
-                # inflight, finds no dummy, and they fall through to "pass" --
-                # so their .et never runs and the group's EP collective blocks
-                # forever. Invisible at tp=pp=1, where the start NPU is the only
-                # NPU an instance owns.
                 schedulers[instance_id].inflight.append(dummy)
-                dp_pending[dg][instance_id].append((dummy, inst2node_mapping[instance_id]))
+                dp_pending[dg][instance_id] = (dummy, inst2node_mapping[instance_id])
 
-                if all(dp_pending[dg][i] for i in dp_groups[dg]):
-                    # Every DP member has a batch queued — take one from each,
-                    # oldest first, and pad them to the group's max (vLLM
-                    # CUDA-graph DP padding) before generating.
-                    round_batches = {i: dp_pending[dg][i].popleft() for i in dp_groups[dg]}
-                    own_workload = None
+                if len(dp_pending[dg]) == len(dp_groups[dg]):
+                    # All DP members accounted for — pad every batch to the
+                    # group's max (vLLM CUDA-graph DP padding) and generate.
                     config = get_config(instances[instance_id]["model_name"])
-                    max_total_len = max(b.total_len for b, _ in round_batches.values())
-                    for b, _ in round_batches.values():
+                    max_total_len = max(b.total_len for b, _ in dp_pending[dg].values())
+                    for b, _ in dp_pending[dg].values():
                         _pad_batch_to_max(b, max_total_len)
                     # MoE AG/RS comm size is anchored to ``max_total_len``
                     # (not ``max × group_size``). The trace generator divides
@@ -792,15 +667,16 @@ def main():
 
                     # Shared workload folder for all DP members
                     first_inst_id = dp_groups[dg][0]
-                    first_batch = round_batches[first_inst_id][0]
+                    first_batch = dp_pending[dg][first_inst_id][0]
                     dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
+                    for b, _ in dp_pending[dg].values():
+                        b.workload_name = dp_workload_name
 
                     for inst_id in dp_groups[dg]:
-                        batch, nid = round_batches[inst_id]
-                        batch.workload_name = dp_workload_name
+                        batch, nid = dp_pending[dg][inst_id]
                         inst = instances[inst_id]
                         inst_cfg = instance_runtime_configs[inst_id]
-                        trace_data = generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
+                        generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
                                        inst["local_ep"], inst["ep_total"], inst["pd_type"],
                                        nid, inst_id,
                                        inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
@@ -813,66 +689,48 @@ def main():
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
-                                       inputs_root=run_paths.inputs_root)
+                                       inputs_root=run_paths.inputs_root,
+                                       expert_routing_distribution_csv=inst_cfg["expert_routing_distribution_csv"],
+                                       expert_offload_config=inst_cfg["expert_offload_config"])
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
                                        workload_name=dp_workload_name,
                                        inputs_root=run_paths.inputs_root,
-                                       save_trace_text=args.save_trace_text,
-                                       trace=trace_data)
-                        # ``fired[0]`` is the NPU that opened this member's
-                        # round -- the one that owes ASTRA-Sim its graph. That is
-                        # normally this very poll, and then it is answered
-                        # directly. With pp_size > 1 the round can instead pop a
-                        # batch that another NPU of the instance opened, or an
-                        # older one this NPU opened, so queue it for that NPU.
-                        ready = get_workload(batch, inst["hardware"], inst_id,
-                                             workload_name=dp_workload_name,
-                                             inputs_root=run_paths.inputs_root)
-                        if batch.fired[0] == sys:
-                            own_workload = ready
-                        else:
-                            dp_ready_workloads[batch.fired[0]].append(ready)
+                                       cleanup_trace=args.cleanup_inputs)
+                        if inst_id != instance_id:
+                            dp_ready_workloads[inst2npu_mapping[inst_id]] = get_workload(batch, inst["hardware"], inst_id,
+                                                                    workload_name=dp_workload_name,
+                                                                    inputs_root=run_paths.inputs_root)
 
-                    if own_workload is not None:
-                        controller.write_flush(p, own_workload)
-                    else:
-                        controller.write_flush(p, _pass_response(router, current, state_changed=True))
+                    dp_pending[dg].clear()
+                    workload = get_workload(dummy, instances[instance_id]["hardware"], instance_id,
+                                            workload_name=dp_workload_name,
+                                            inputs_root=run_paths.inputs_root)
+                    controller.write_flush(p, workload)
                     responded = True
                 else:
-                    # Joined the round with a dummy; the round is not complete.
-                    controller.write_flush(p, _pass_response(router, current, state_changed=True))
+                    controller.write_flush(p, "pass")
                     responded = True
         # runnable batch exists
         elif new_req is not None:
-            # ``_build_batch`` returns a batch fired only by the NPU that built
-            # it, so a longer ``fired`` means this poll joined a batch through
-            # ``_schedule_existing``. With DP groups any NPU of an instance may
-            # open a round (the idle-member dummy in particular), so the start
-            # NPU can arrive here holding a batch it did not build -- it has to
-            # be served like any other joiner, not registered into the round a
-            # second time.
-            built_here = len(new_req.fired) == 1  # implies sys is the start NPU
-            if built_here:  # first NPU of the instance, opening a new batch
+            if sys == inst2npu_mapping[instance_id]:  # first NPU of the instance
                 waiting_request[instance_id] = False
                 instance = instances[instance_id]
                 dg = inst_dp_group.get(instance_id)
 
                 if dg is not None:
                     # DP group: defer trace generation until all members scheduled
-                    dp_pending[dg][instance_id].append((new_req, node_id))
+                    dp_pending[dg][instance_id] = (new_req, node_id)
 
-                    if all(dp_pending[dg][i] for i in dp_groups[dg]):
-                        # Every DP member has a batch queued — take one from
-                        # each, oldest first, and pad them to the group's max
-                        # (vLLM CUDA-graph DP padding) so smaller batches gain
-                        # dummy decodes that all layers still compute over.
-                        round_batches = {i: dp_pending[dg][i].popleft() for i in dp_groups[dg]}
-                        own_workload = None
+                    if len(dp_pending[dg]) == len(dp_groups[dg]):
+                        # All DP members have scheduled — pad every batch to
+                        # the group's max (vLLM CUDA-graph DP padding) so
+                        # smaller batches gain dummy decodes that all layers
+                        # still compute over.
                         config = get_config(instance["model_name"])
-                        max_total_len = max(b.total_len for b, _ in round_batches.values())
-                        for b, _ in round_batches.values():
+                        max_total_len = max(b.total_len for b, _ in dp_pending[dg].values())
+                        for b, _ in dp_pending[dg].values():
                             _pad_batch_to_max(b, max_total_len)
                         # See twin block above: anchor MoE comm to max_total_len
                         # (no group-size multiplier).
@@ -880,15 +738,16 @@ def main():
 
                         # Shared workload folder for all DP members
                         first_inst_id = dp_groups[dg][0]
-                        first_batch = round_batches[first_inst_id][0]
+                        first_batch = dp_pending[dg][first_inst_id][0]
                         dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
+                        for b, _ in dp_pending[dg].values():
+                            b.workload_name = dp_workload_name
 
                         for inst_id in dp_groups[dg]:
-                            batch, nid = round_batches[inst_id]
-                            batch.workload_name = dp_workload_name
+                            batch, nid = dp_pending[dg][inst_id]
                             inst = instances[inst_id]
                             inst_cfg = instance_runtime_configs[inst_id]
-                            trace_data = generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
+                            generate_trace(batch, inst["hardware"], inst["tp_size"], inst["pp_size"],
                                            inst["local_ep"], inst["ep_total"], inst["pd_type"],
                                            nid, inst_id,
                                            inst_cfg["max_num_batched_tokens"], inst_cfg["max_num_seqs"],
@@ -901,38 +760,33 @@ def main():
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
-                                           inputs_root=run_paths.inputs_root)
+                                           inputs_root=run_paths.inputs_root,
+                                           expert_routing_distribution_csv=inst_cfg["expert_routing_distribution_csv"],
+                                           expert_offload_config=inst_cfg["expert_offload_config"])
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
                                            workload_name=dp_workload_name,
                                            inputs_root=run_paths.inputs_root,
-                                           save_trace_text=args.save_trace_text,
-                                           trace=trace_data)
-                            # See the twin block above: the NPU that opened a
-                            # member's round owes its graph, and that is normally
-                            # this poll.
-                            ready = get_workload(batch, inst["hardware"], inst_id,
-                                                 workload_name=dp_workload_name,
-                                                 inputs_root=run_paths.inputs_root)
-                            if batch.fired[0] == sys:
-                                own_workload = ready
-                            else:
-                                dp_ready_workloads[batch.fired[0]].append(ready)
+                                           cleanup_trace=args.cleanup_inputs)
+                            if inst_id != instance_id:
+                                dp_ready_workloads[inst2npu_mapping[inst_id]] = get_workload(batch, inst["hardware"], inst_id,
+                                                                        workload_name=dp_workload_name,
+                                                                        inputs_root=run_paths.inputs_root)
 
-                        if own_workload is not None:
-                            controller.write_flush(p, own_workload)
-                        else:
-                            controller.write_flush(p, _pass_response(router, current, state_changed=True))
-                        responded = True
+                        dp_pending[dg].clear()
+                        workload = get_workload(new_req, instance["hardware"], instance_id,
+                                                workload_name=dp_workload_name,
+                                                inputs_root=run_paths.inputs_root)
+                        controller.write_flush(p, workload)
                     else:
                         # Waiting for other DP members — send pass
-                        controller.write_flush(p, _pass_response(router, current, state_changed=True))
+                        controller.write_flush(p, "pass")
                         responded = True
                 else:
                     # Independent instance: generate trace immediately
                     inst_cfg = instance_runtime_configs[instance_id]
-                    trace_data = generate_trace(new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
+                    generate_trace(new_req, instance["hardware"], instance["tp_size"], instance["pp_size"],
                                    instance["local_ep"], instance["ep_total"],
                                    instance["pd_type"],
                                    node_id, instance_id,
@@ -944,41 +798,31 @@ def main():
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"],
-                                   inputs_root=run_paths.inputs_root)
+                                   inputs_root=run_paths.inputs_root,
+                                   expert_routing_distribution_csv=inst_cfg["expert_routing_distribution_csv"],
+                                   expert_offload_config=inst_cfg["expert_offload_config"])
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
                                    inputs_root=run_paths.inputs_root,
-                                   save_trace_text=args.save_trace_text,
-                                   trace=trace_data)
+                                   cleanup_trace=args.cleanup_inputs)
                     workload = get_workload(new_req, instance["hardware"], instance_id,
                                             inputs_root=run_paths.inputs_root)
                     controller.write_flush(p, workload)
-            else:
-                # Joined an existing batch: pick up its workload. workload_name
-                # matters for a DP batch, whose graph lives in the group's shared
-                # folder -- deriving the default instance<id>_batch<id> path here
-                # points at a directory that was never written, and ASTRA-Sim
-                # stalls on the missing .et instead of failing.
-                #
-                # A DP batch is in ``inflight`` from the moment its own instance
-                # schedules it, but it is only stamped with the shared folder
-                # when the *last* member of the group joins the barrier. In that
-                # window ``_schedule_existing`` will hand it to this NPU with no
-                # name yet, so wait instead of guessing a path: hand the claim
-                # back and pass, and the batch is re-offered on a later poll once
-                # the round is assembled. The batch is necessarily queued in
-                # ``dp_pending`` already (it exists because an NPU of this
-                # instance opened it), so passing here cannot stall the barrier.
-                if sys == inst2npu_mapping[instance_id]:
-                    waiting_request[instance_id] = False
-                if instance_id in inst_dp_group and new_req.workload_name is None:
-                    new_req.fired.remove(sys)
-                    controller.write_flush(p, _pass_response(router, current, state_changed=True))
+            elif new_req is not None:
+                # Non-first NPU: pick up existing batch workload.  For DP groups,
+                # the shared workload name is assigned only after every DP member
+                # has reached the same batch; until then, do not let a TP peer
+                # fall back to the default instanceX_batchY path.
+                workload_name = getattr(new_req, "workload_name", None)
+                if inst_dp_group.get(instance_id) is not None and workload_name is None:
+                    if sys in new_req.fired:
+                        new_req.fired.remove(sys)
+                    controller.write_flush(p, "pass")
                     responded = True
                 else:
                     workload = get_workload(new_req, instances[instance_id]["hardware"], instance_id,
-                                            workload_name=new_req.workload_name,
+                                            workload_name=workload_name,
                                             inputs_root=run_paths.inputs_root)
                     controller.write_flush(p, workload)
 
@@ -1006,12 +850,8 @@ def main():
             ######### Per Instance Metrics #########
 
             for inst_id in range(num_instances):
-                # len(running), not the size of the in-flight batch: the persistent
-                # running set is the exact analogue of vLLM's num_running_reqs, which
-                # is what bench compares this column against. The batch is only the
-                # subset that fit in this step's token budget.
-                running_reqs = len(schedulers[inst_id].running)
-                waiting_reqs = len([req for req in schedulers[inst_id].waiting if req.arrival <= current])
+                running_reqs = sum(len(batch.requests) for batch in schedulers[inst_id].inflight)
+                waiting_reqs = len([req for req in schedulers[inst_id].request if req.arrival <= current])
 
                 mem = schedulers[inst_id].memory
                 npu_used_mb = mem.npu_used / MB_TO_BYTE
@@ -1025,7 +865,7 @@ def main():
                     f"({npu_util:.3f} % Used)"
                 )
                 if schedulers[inst_id].enable_prefix_caching:
-                    line += schedulers[inst_id].memory.format_prefix_info()
+                    line += schedulers[inst_id].memory.npu_prefix_cache.format_prefix_info()
                 print_markup(line)
 
             ######### Per Node Metrics #########
@@ -1035,7 +875,7 @@ def main():
                     node_cpu_usage = 0
                     inst_usage = []
                     if any_prefix_caching and enable_prefix_sharing and prefix_storage == "CPU":
-                        node_cpu_usage = prefix_pools[node_id].used_bytes()
+                        node_cpu_usage = prefix_pools[node_id].total_size() * prefix_pools[node_id].kv_size
                     else:
                         for inst_id in inst_ids:
                             inst_cpu_usage = schedulers[inst_id].memory.cpu_used
@@ -1051,7 +891,7 @@ def main():
                         f"{cpu_util:.3f} % Used "
                     )
                     if any_prefix_caching and enable_prefix_sharing and prefix_storage == "CPU":
-                        line += prefix_pools[node_id].stats.format_prefix_info()
+                        line += prefix_pools[node_id].format_prefix_info()
 
                     if (any_prefix_caching and enable_prefix_sharing and prefix_storage == "CPU") or (len(inst_ids) == 1):
                         print_markup(line)
@@ -1067,8 +907,8 @@ def main():
                 if enable_prefix_sharing:
                     num_prefix_pool = len(prefix_pools)
                     for cxl_id, cxl_pool in enumerate(prefix_pools):
-                        cxl_usage = cxl_pool.used_bytes()
-                        cxl_util = cxl_pool.usage()
+                        cxl_usage = cxl_pool.total_size() * cxl_pool.kv_size
+                        cxl_util = cxl_usage / cxl_pool.capacity
                         if not power_modeling and cxl_id == num_prefix_pool - 1:
                             tree_indent = '└─'
                         print_markup(
@@ -1082,11 +922,12 @@ def main():
                         if sched.enable_prefix_caching
                     ]
                     for pos, inst_id in enumerate(enabled_inst_ids):
-                        second_tier = schedulers[inst_id].memory.storage_pool
+                        second_tier = getattr(
+                            schedulers[inst_id].memory, "second_tier_prefix_cache", None)
                         if second_tier is None:
                             continue
-                        cxl_usage = second_tier.used_bytes()
-                        cxl_util = second_tier.usage()
+                        cxl_usage = second_tier.total_size() * second_tier.kv_size
+                        cxl_util = cxl_usage / second_tier.capacity
                         if not power_modeling and pos == len(enabled_inst_ids) - 1:
                             tree_indent = '└─'
                         print_markup(
@@ -1115,7 +956,7 @@ def main():
                 if not all_dp_empty:
                     # Other DP members still have work — keep this instance alive for dummy waves
                     if not responded:
-                        controller.write_flush(p, _pass_response(router, current))
+                        controller.write_flush(p, "pass")
                     flush.stdout.flush()
                     continue
 
@@ -1133,7 +974,7 @@ def main():
                 for inst_idx in range(num_instances):
                     schedulers[inst_idx].memory.free_prefix_cache()
                     schedulers[inst_idx].memory.free_weight()
-                
+
                 # check memory leak before exit
                 schedulers[inst_idx].memory.is_free()
 
@@ -1146,15 +987,12 @@ def main():
             # If all instances are idle but deferred sessions have pending
             # requests with future arrival times (tool calls still running),
             # advance current time so the next iteration can pick them up.
-            # Built before the jump below: _pass_response compares against
-            # the clock ASTRA-Sim is actually at, not the one we skip to.
-            pass_msg = _pass_response(router, current)
             if router.has_deferred_sessions() or router.has_pending_requests():
                 next_arrival = router.get_next_pending_arrival()
                 if next_arrival is not None and next_arrival > current:
                     current = next_arrival
-            controller.write_flush(p, pass_msg)
-        
+            controller.write_flush(p, "pass")
+
         # flush
         flush.stdout.flush()
 
@@ -1182,12 +1020,12 @@ def main():
             total_npu_hit_tokens += temp_npu_b
             if not enable_prefix_sharing:
                 total_cpu_hit_tokens += temp_cpu_b
-        
+
         if enable_prefix_sharing:
             for pool in prefix_pools:
-                _, temp_cpu_b = pool.stats.return_prefix_info()
+                _, temp_cpu_b = pool.return_prefix_info()
                 total_cpu_hit_tokens += temp_cpu_b
-    
+
     # This is total system's throughput
     total_latency = current/FREQ
     print_rule()
@@ -1197,26 +1035,13 @@ def main():
     print_markup(f"Total requests:                                                     {req_cnt}")
     print_markup(f"Total clocks (ns):                                                  {current}")
     print_markup(f"Total latency (s):                                                  {total_latency:.3f}")
-    # total_prompt is the vLLM prompt-throughput gauge: it counts every token
-    # pushed through prefill, including prefix-cache hits and anything recomputed
-    # after a preemption. Report the dataset input from the requests themselves
-    # rather than by subtracting the recompute counter -- a request preempted
-    # again mid-recompute is charged its full remaining work each time it is
-    # re-admitted, so the two are not each other's complement.
-    total_recompute = sum(s.recompute_tokens for s in schedulers)
-    total_preempt = sum(s.num_preemptions for s in schedulers)
-    total_input = sum(req.original_input for s in schedulers for req in s.done)
-    print_markup(f"Total input tokens:                                                 {total_input}")
-    if total_preempt:
-        print_markup(f"Preemptions:                                                        {total_preempt}")
-    if total_recompute:
-        print_markup(f"Recomputed prompt tokens (preemption):                               {total_recompute}")
+    print_markup(f"Total input tokens:                                                 {total_prompt}")
     print_markup(f"Total generated tokens:                                             {total_gen}")
     print_markup(f"Request throughput (req/s):                                         {req_cnt/total_latency:.2f}")
     print_markup(f"Average prompt throughput (tok/s):                                  {total_prompt/total_latency:.2f}")
     print_markup(f"Average generation throughput (tok/s):                              {total_gen/total_latency:.2f}")
     print_markup(f"Total token throughput (tok/s):                                     {(total_prompt + total_gen)/total_latency:.2f}")
-    print_markup(f"Throughput per {log_interval:g} sec (\\[prompt_throughput], \\[gen_throughput]): {throughput}")
+    print_markup(f"Throughput per {1/RATIO} sec (\\[prompt_throughput], \\[gen_throughput]): {throughput}")
     print_rule()
     if any_prefix_caching:
         print_rule("[sim.tagline]Prefix Caching Results[/]")
@@ -1237,16 +1062,16 @@ def main():
         print_markup(f"Total energy consumption (kJ):                                      {total_energy/1000:.2f}")
         # Each node results
         power_model.print_power_summary()
-        print_markup(f"Power per {log_interval:g} sec (W): {power_model.power_time_series}")
+        print_markup(f"Power per {1/RATIO} sec (W): {power_model.power_time_series}")
         print_rule()
     # Each instacne results
     for i in range(num_instances):
         print_rule(f"[sim.tagline]Instance \\[{i}][/]")
         schedulers[i].print_result()
         print_rule()
-    
+
     # Important informations about metrics
-    # The TTFT (Time to First Token) in our simulator differs from vllm. 
+    # The TTFT (Time to First Token) in our simulator differs from vllm.
     # While vllm measures TTFT as the time when the client receives the first token,
     # Our simulator measures it as the time when the computation of the first token is completed.
     # Therefore, vllm gets much more higher TTFT.
@@ -1257,13 +1082,11 @@ def main():
         for i in range(num_instances):
             schedulers[i].save_output(output_file, is_append=False if i == 0 else True)
 
-    # --save-trace-text writes the text into the run directory, so keeping it
-    # is implied: producing the text and then deleting it would be pointless.
-    if not (args.keep_inputs or args.save_trace_text):
+    if args.cleanup_inputs:
         _cleanup_inputs_root(run_paths, logger)
-    
 
-if __name__ == "__main__": 
+
+if __name__ == "__main__":
     # For simulation time breakdown
     # profiler = Profiler()
     # profiler.start()

@@ -26,14 +26,6 @@ This command generates static content into the `build` directory and can be serv
 
 ## Deployment
 
-Using SSH:
-
-```bash
-USE_SSH=true yarn deploy
-```
-
-Not using SSH:
-
 ```bash
 GIT_USER=<Your GitHub username> yarn deploy
 ```

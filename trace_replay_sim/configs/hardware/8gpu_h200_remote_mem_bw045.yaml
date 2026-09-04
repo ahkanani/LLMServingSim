@@ -1,0 +1,19 @@
+hardware:
+  hardware_id: 8gpu_h200_remote_mem_bw045
+  description: "Remote-memory H200 study config: 8 GPUs + 8 remote-memory devices, 0.45 TB/s each."
+  gpu_count: 8
+  gpu_bw_tbps_each: 4.0
+  # Compatibility fields retained for existing PIM-oriented parser paths.
+  pim_count: 1
+  pim_bw_tbps_each: 1.0
+  pim_granularity: 1
+  offload_backend: remote_memory
+  remote_count: 8
+  remote_bw_tbps_each: 0.45
+  remote_capacity_gb_each: 512
+  hbm_capacity_gb_each: 141
+  hbm_cost_per_gb: 1.0
+  remote_cost_per_gb: 0.2
+  metadata:
+    study: remote_memory
+    bandwidth_axis_tbps_each: 0.45

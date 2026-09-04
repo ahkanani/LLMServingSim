@@ -546,7 +546,10 @@ def persist_meta(
         "attention_grid": _attention_grid_spec(args, eff_mnbt, eff_msq),
         "measurement_iterations": args.measurement_iterations,
         "skew_profile": _skew_meta_block(args),
-        "skew_fit": _skew_fit_block(variant_root, args.tp_degrees),
+        "skew_fit": (
+            {"enabled": False, "reason": "skip_skew"}
+            if args.skip_skew else _skew_fit_block(variant_root, args.tp_degrees)
+        ),
     }
     variant_root.mkdir(parents=True, exist_ok=True)
     out = variant_root / "meta.yaml"

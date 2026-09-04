@@ -71,6 +71,7 @@ const sidebars: SidebarsConfig = {
     {
       type: 'category',
       label: 'Simulator',
+      link: {type: 'doc', id: 'simulator/architecture'},
       items: [
         'simulator/architecture',
         'simulator/request-lifecycle',
@@ -132,7 +133,6 @@ const sidebars: SidebarsConfig = {
         'reference/model-config',
         'reference/pim-config',
         'reference/trace-format',
-        'reference/bench-cli',
       ],
     },
     'artifact-evaluation',

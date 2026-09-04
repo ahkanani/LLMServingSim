@@ -4,7 +4,7 @@
 docker run --name llm_profile \
   --gpus all \
   -it \
-  -e HUGGING_FACE_HUB_TOKEN="<your_token>" \
+  -e HUGGING_FACE_HUB_TOKEN="${HUGGING_FACE_HUB_TOKEN:-}" \
   -v $(pwd):/workspace \
   --volume ~/.cache/huggingface:/root/.cache/huggingface \
   --shm-size=16g \

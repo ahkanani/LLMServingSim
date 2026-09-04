@@ -16,9 +16,7 @@
     "serve": "docusaurus serve",
     "write-translations": "docusaurus write-translations",
     "write-heading-ids": "docusaurus write-heading-ids",
-    "typecheck": "tsc",
-    "check-rendered": "node scripts/check-rendered.mjs",
-    "postbuild": "node scripts/check-rendered.mjs"
+    "typecheck": "tsc"
   },
   "dependencies": {
     "@docusaurus/core": "3.10.0",

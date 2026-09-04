@@ -95,15 +95,9 @@ python -m serving \
 
 What you should see:
 
-- A startup banner, then a **KV Cache Initialization** line reporting
-  the derived capacity per instance.
-- A heartbeat every second: `[N.0s] Avg prompt throughput: … tokens/s,
-  Avg generation throughput: … tokens/s`, followed by an indented
-  `├─Running Instance[0]: … reqs, Waiting: … reqs, …` branch.
-- Ruled **Throughput Results** / **Prefix Caching Results** /
-  **Instance [0]** sections at the end, with `Total requests`,
-  `Total clocks (ns)`, and per-instance mean / median / P99 TTFT, TPOT
-  and ITL in milliseconds.
+- A few seconds of throughput log lines
+  (`step=N batch=K prompt_t=… decode_t=…`).
+- A summary line at the end with totals (`Finished N requests`).
 - `outputs/onboarding_smoke.csv` containing one row per request.
 
 If you got that, the simulator is working. If you got an error, see
