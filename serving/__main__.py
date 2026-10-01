@@ -11,6 +11,7 @@ import subprocess
 import argparse
 import json
 import shutil
+import copy
 from time import time
 from collections import defaultdict
 
@@ -27,6 +28,7 @@ from serving.core.router import *
 from serving.core.power_model import *
 from serving.core.logger import *
 from serving.core.run_paths import build_run_paths, resolve_run_id
+from serving.core.expert_offload import ExpertOffloadConfig
 import sys as flush
 
 from pyinstrument import Profiler
@@ -160,6 +162,20 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             raise ValueError(f"Unsupported kv_cache_dtype '{kv_cache_dtype}' for instance {instance_id}")
 
         enable_attn_offloading = instance.get("enable_attn_offloading", args.enable_attn_offloading)
+        enable_expert_offloading = instance.get(
+            "enable_expert_offloading", args.enable_expert_offloading)
+        expert_offload = dict(instance.get("expert_offload", {}) or {})
+        expert_routing_distribution_csv = expert_offload.get("routing_distribution_csv")
+        if expert_routing_distribution_csv is None:
+            expert_routing_distribution_csv = instance.get(
+                "expert_routing_distribution_csv", args.expert_routing_distribution_csv)
+        if expert_routing_distribution_csv is not None:
+            expert_offload.setdefault(
+                "routing_distribution_csv", expert_routing_distribution_csv)
+        expert_offload_config = ExpertOffloadConfig.from_dict(
+            expert_offload,
+            enabled=enable_expert_offloading,
+        )
         enable_sub_batch_interleaving = instance.get(
             "enable_sub_batch_interleaving", args.enable_sub_batch_interleaving)
         if enable_sub_batch_interleaving and not enable_attn_offloading:
@@ -184,6 +200,10 @@ def _build_instance_runtime_configs(instances, args, dtype_to_bits):
             "enable_local_offloading": instance.get(
                 "enable_local_offloading", args.enable_local_offloading),
             "enable_attn_offloading": enable_attn_offloading,
+            "enable_expert_offloading": enable_expert_offloading,
+            "expert_offload": expert_offload,
+            "expert_offload_config": expert_offload_config,
+            "expert_routing_distribution_csv": expert_routing_distribution_csv,
             "enable_sub_batch_interleaving": enable_sub_batch_interleaving,
             "enable_block_copy": instance.get("enable_block_copy", args.enable_block_copy),
         })
@@ -200,8 +220,8 @@ def main():
 
     # -------------------------------------- Argument parsing --------------------------------------
     parser = argparse.ArgumentParser(prog='python -m serving',
-                                     description='LLMServingSim') 
-    
+                                     description='LLMServingSim')
+
     parser.add_argument('--cluster-config', type=str, default='configs/cluster/single_node_single_instance.json',
                         help='path to cluster config JSON defining node topology, instance layout, hardware, and memory hierarchy')
     parser.add_argument('--max-num-seqs', type=int, default=128,
@@ -230,15 +250,17 @@ def main():
                         'a trained load-balanced learned gate), '
                         'RR (round-robin), RAND (uniform random per token), '
                         'CUSTOM (user-defined)')
+    parser.add_argument('--expert-routing-distribution-csv', type=str, default=None,
+                        help='path to a CSV describing a custom per-expert routing distribution. '
+                        'Used when --expert-routing-policy CUSTOM is selected')
     parser.add_argument('--enable-block-copy', action=argparse.BooleanOptionalAction,
                         default=True,
                         help='Replay one transformer block\'s trace across every '
                         'layer instead of re-computing the routing per layer — '
                         'cuts trace-generation time roughly num_hidden_layers× '
-                        'on MoE models. Safe with BALANCED (deterministic); '
-                        'RR/RAND get a small per-layer variance averaged out. '
-                        'Disable only for CUSTOM policies that need faithful '
-                        'per-layer variance.')
+                        'on MoE models. Safe with layer-invariant routing; '
+                        'CUSTOM distributions with layer-specific rows disable '
+                        'this automatically.')
     parser.add_argument('--enable-prefix-caching', action=argparse.BooleanOptionalAction, default=True,
                         help='enable prefix caching via RadixAttention to reuse KV cache across requests '
                         'with shared prefixes (default: enabled). Use --no-enable-prefix-caching to disable')
@@ -254,6 +276,9 @@ def main():
                         'Recommended to disable unless weight memory access is not counted in profiling')
     parser.add_argument('--enable-attn-offloading', action='store_true', default=False,
                         help='enable attention computation offloading to PIM (Processing-In-Memory) devices')
+    parser.add_argument('--enable-expert-offloading', action='store_true', default=False,
+                        help='enable static MoE expert offloading to PIM. '
+                        'prepares PIM memory for future expert offload trace generation')
     parser.add_argument('--enable-sub-batch-interleaving', action='store_true', default=False,
                         help='enable sub-batch interleaving to overlap XPU and PIM computation. '
                         'Requires --enable-attn-offloading')
@@ -293,7 +318,7 @@ def main():
                         help='network simulation backend: analytical (fast, default) or ns3 (detailed, WIP)')
 
     args = parser.parse_args()
-    
+
     args.run_id = resolve_run_id(args.run_id)
     run_paths = build_run_paths(astra_sim, args.run_id, args.inputs_root)
     args.inputs_root = run_paths.inputs_root
@@ -305,7 +330,7 @@ def main():
     print_input_config(args=args)
     print_markup("[sim.heading]▶ Starting simulation...[/]\n")
     flush.stdout.flush()
-    
+
     _dtype_to_bits = {'float16': 16, 'bfloat16': 16, 'float32': 32, 'fp8': 8, 'int8': 8}
     request_routing_policy=args.request_routing_policy
     expert_routing_policy=args.expert_routing_policy
@@ -323,27 +348,31 @@ def main():
         inst.get("enable_local_offloading", False) for inst in raw_instances)
     build_enable_attn_offloading = args.enable_attn_offloading or any(
         inst.get("enable_attn_offloading", False) for inst in raw_instances)
+    build_enable_expert_offloading = args.enable_expert_offloading or any(
+        inst.get("enable_expert_offloading", False) for inst in raw_instances)
+    build_enable_pim = build_enable_attn_offloading or build_enable_expert_offloading
     # ---------------------------------- Extract cluster config -----------------------------------
     cluster = build_cluster_config(
         astra_sim, args.cluster_config, build_enable_local_offloading, build_enable_attn_offloading,
-        inputs_root=run_paths.inputs_root)
+        inputs_root=run_paths.inputs_root, enable_pim=build_enable_pim)
+    trace_cluster = copy.deepcopy(cluster)
     num_nodes = cluster["num_nodes"]
     num_instances = cluster["num_instances"]
-    instances = cluster["instances"]
-    inst2node_mapping = cluster["inst2node_mapping"]
-    inst2npu_mapping = cluster["inst2npu_mapping"]
-    npu2inst_mapping = cluster["npu2inst_mapping"]
-    prefill_instance = cluster["prefill_instance"]
-    decode_instance = cluster["decode_instance"]
-    start_npu_ids = cluster["start_npu_ids"]
-    end_npu_ids = cluster["end_npu_ids"]
-    placement = cluster["placement"]
-    block_mode_on = cluster["block_mode_on"]
+    instances = trace_cluster["instances"]
+    inst2node_mapping = trace_cluster["inst2node_mapping"]
+    inst2npu_mapping = trace_cluster["inst2npu_mapping"]
+    npu2inst_mapping = trace_cluster["npu2inst_mapping"]
+    prefill_instance = trace_cluster["prefill_instance"]
+    decode_instance = trace_cluster["decode_instance"]
+    start_npu_ids = trace_cluster["start_npu_ids"]
+    end_npu_ids = trace_cluster["end_npu_ids"]
+    placement = trace_cluster["placement"]
+    block_mode_on = trace_cluster["block_mode_on"]
     total_npu = cluster["total_npu"]
     cpu_mem_size = cluster["cpu_mem_size"]
     power_modeling = cluster["power_modeling"]
-    power_configs = cluster["power_configs"]
-    pim_models = cluster["pim_models"]
+    power_configs = trace_cluster["power_configs"]
+    pim_models = trace_cluster["pim_models"]
     instance_runtime_configs = _build_instance_runtime_configs(instances, args, _dtype_to_bits)
     any_prefix_caching = any(cfg["enable_prefix_caching"] for cfg in instance_runtime_configs)
     # ----------------------------------------- Set config -----------------------------------------
@@ -360,7 +389,7 @@ def main():
     memory=run_paths.memory_config
     system=run_paths.system_config
     # ------------------------------------- Prepare simulation -------------------------------------
-    # Need to extract each instance's memory accessability 
+    # Need to extract each instance's memory accessability
     node2inst_mapping = defaultdict(list)
     for inst_id, node_id in inst2node_mapping.items():
         node2inst_mapping[node_id].append(inst_id)
@@ -442,8 +471,8 @@ def main():
             prefix_pool = prefix_pools[prefix_pool_index]
         cxl_mem = 0
         if cluster["cxl_mem_size"] > 0:
-            cxl_mem = cluster["cxl_mem_size"]        
-        
+            cxl_mem = cluster["cxl_mem_size"]
+
         # Make scheduler for each instance
 
         inst_cfg = instance_runtime_configs[instance_id]
@@ -543,15 +572,15 @@ def main():
     # Pending batches per DP group (waiting for all members to schedule)
     dp_pending = {dg: {} for dg in dp_groups}  # dp_group -> {instance_id: (new_req, sys)}
     # Pre-generated workloads ready to submit on next "Waiting"
-    dp_ready_workloads = {}  # instance_id -> workload_path
+    dp_ready_workloads = {}  # start_npu_id -> workload_path for DP peer start ranks
 
     # ----------------------------------- Start simulation loop ------------------------------------
     # Starting simulation, one while loop processes one iteration
     while True:
-        
+
         out = controller.read_wait(p)
         out_dict = controller.parse_output(out[-2])
-        
+
         if out_dict != None:
             sys = out_dict['sys']
             id = out_dict['id']
@@ -601,8 +630,8 @@ def main():
         responded = False  # track whether we already sent a response to ASTRA-Sim
 
         # Check if a pre-generated workload is ready for this instance (from DP sync)
-        if new_req is None and instance_id in dp_ready_workloads:
-            controller.write_flush(p, dp_ready_workloads.pop(instance_id))
+        if new_req is None and sys in dp_ready_workloads:
+            controller.write_flush(p, dp_ready_workloads.pop(sys))
             responded = True
         # DP group: truly idle instance (no inflight batch) — create dummy batch so ALLTOALL syncs
         elif new_req is None and instance_id in inst_dp_group and sys == inst2npu_mapping[instance_id] and len(schedulers[instance_id].inflight) == 0:
@@ -615,6 +644,7 @@ def main():
                 dummy = Batch(schedulers[instance_id].get_batch_id(), instances[instance_id]["model_name"],
                               1, 1, [1], [], 0, 1, [], [], [1], current, 0)
                 dummy.fired.append(sys)
+                schedulers[instance_id].inflight.append(dummy)
                 dp_pending[dg][instance_id] = (dummy, inst2node_mapping[instance_id])
 
                 if len(dp_pending[dg]) == len(dp_groups[dg]):
@@ -639,6 +669,8 @@ def main():
                     first_inst_id = dp_groups[dg][0]
                     first_batch = dp_pending[dg][first_inst_id][0]
                     dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
+                    for b, _ in dp_pending[dg].values():
+                        b.workload_name = dp_workload_name
 
                     for inst_id in dp_groups[dg]:
                         batch, nid = dp_pending[dg][inst_id]
@@ -657,7 +689,9 @@ def main():
                                        tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                        dp_sum_total_len=sum_total_len,
                                        enable_block_copy=inst_cfg["enable_block_copy"],
-                                       inputs_root=run_paths.inputs_root)
+                                       inputs_root=run_paths.inputs_root,
+                                       expert_routing_distribution_csv=inst_cfg["expert_routing_distribution_csv"],
+                                       expert_offload_config=inst_cfg["expert_offload_config"])
                         generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                        inst_id, inst2npu_mapping[inst_id],
                                        inst_cfg["enable_local_offloading"],
@@ -665,7 +699,7 @@ def main():
                                        inputs_root=run_paths.inputs_root,
                                        cleanup_trace=args.cleanup_inputs)
                         if inst_id != instance_id:
-                            dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
+                            dp_ready_workloads[inst2npu_mapping[inst_id]] = get_workload(batch, inst["hardware"], inst_id,
                                                                     workload_name=dp_workload_name,
                                                                     inputs_root=run_paths.inputs_root)
 
@@ -706,6 +740,8 @@ def main():
                         first_inst_id = dp_groups[dg][0]
                         first_batch = dp_pending[dg][first_inst_id][0]
                         dp_workload_name = f'{instances[first_inst_id]["hardware"]}/{instances[first_inst_id]["model_name"]}/dp_{dg}_batch{first_batch.batch_id}'
+                        for b, _ in dp_pending[dg].values():
+                            b.workload_name = dp_workload_name
 
                         for inst_id in dp_groups[dg]:
                             batch, nid = dp_pending[dg][inst_id]
@@ -724,7 +760,9 @@ def main():
                                            tp_dim=inst.get("tp_dim"), ep_dim=inst.get("ep_dim"),
                                            dp_sum_total_len=sum_total_len,
                                            enable_block_copy=inst_cfg["enable_block_copy"],
-                                           inputs_root=run_paths.inputs_root)
+                                           inputs_root=run_paths.inputs_root,
+                                           expert_routing_distribution_csv=inst_cfg["expert_routing_distribution_csv"],
+                                           expert_offload_config=inst_cfg["expert_offload_config"])
                             generate_graph(batch, inst["hardware"], inst["num_npus"], nid,
                                            inst_id, inst2npu_mapping[inst_id],
                                            inst_cfg["enable_local_offloading"],
@@ -732,7 +770,7 @@ def main():
                                            inputs_root=run_paths.inputs_root,
                                            cleanup_trace=args.cleanup_inputs)
                             if inst_id != instance_id:
-                                dp_ready_workloads[inst_id] = get_workload(batch, inst["hardware"], inst_id,
+                                dp_ready_workloads[inst2npu_mapping[inst_id]] = get_workload(batch, inst["hardware"], inst_id,
                                                                         workload_name=dp_workload_name,
                                                                         inputs_root=run_paths.inputs_root)
 
@@ -760,7 +798,9 @@ def main():
                                    dtype=inst_cfg["dtype"], kv_cache_dtype=inst_cfg["kv_cache_dtype"],
                                    tp_dim=instance["tp_dim"], ep_dim=instance["ep_dim"],
                                    enable_block_copy=inst_cfg["enable_block_copy"],
-                                   inputs_root=run_paths.inputs_root)
+                                   inputs_root=run_paths.inputs_root,
+                                   expert_routing_distribution_csv=inst_cfg["expert_routing_distribution_csv"],
+                                   expert_offload_config=inst_cfg["expert_offload_config"])
                     generate_graph(new_req, instance["hardware"], instance["num_npus"], node_id,
                                    instance_id, inst2npu_mapping[instance_id],
                                    inst_cfg["enable_local_offloading"],
@@ -770,10 +810,21 @@ def main():
                                             inputs_root=run_paths.inputs_root)
                     controller.write_flush(p, workload)
             elif new_req is not None:
-                # Non-first NPU: pick up existing batch workload
-                workload = get_workload(new_req, instances[instance_id]["hardware"], instance_id,
-                                        inputs_root=run_paths.inputs_root)
-                controller.write_flush(p, workload)
+                # Non-first NPU: pick up existing batch workload.  For DP groups,
+                # the shared workload name is assigned only after every DP member
+                # has reached the same batch; until then, do not let a TP peer
+                # fall back to the default instanceX_batchY path.
+                workload_name = getattr(new_req, "workload_name", None)
+                if inst_dp_group.get(instance_id) is not None and workload_name is None:
+                    if sys in new_req.fired:
+                        new_req.fired.remove(sys)
+                    controller.write_flush(p, "pass")
+                    responded = True
+                else:
+                    workload = get_workload(new_req, instances[instance_id]["hardware"], instance_id,
+                                            workload_name=workload_name,
+                                            inputs_root=run_paths.inputs_root)
+                    controller.write_flush(p, workload)
 
         # check time to store throughput (only print on start NPU to avoid transient states)
         if current > last_log + INTERVAL and sys == inst2npu_mapping[instance_id]:
@@ -923,7 +974,7 @@ def main():
                 for inst_idx in range(num_instances):
                     schedulers[inst_idx].memory.free_prefix_cache()
                     schedulers[inst_idx].memory.free_weight()
-                
+
                 # check memory leak before exit
                 schedulers[inst_idx].memory.is_free()
 
@@ -941,7 +992,7 @@ def main():
                 if next_arrival is not None and next_arrival > current:
                     current = next_arrival
             controller.write_flush(p, "pass")
-        
+
         # flush
         flush.stdout.flush()
 
@@ -969,12 +1020,12 @@ def main():
             total_npu_hit_tokens += temp_npu_b
             if not enable_prefix_sharing:
                 total_cpu_hit_tokens += temp_cpu_b
-        
+
         if enable_prefix_sharing:
             for pool in prefix_pools:
                 _, temp_cpu_b = pool.return_prefix_info()
                 total_cpu_hit_tokens += temp_cpu_b
-    
+
     # This is total system's throughput
     total_latency = current/FREQ
     print_rule()
@@ -1018,9 +1069,9 @@ def main():
         print_rule(f"[sim.tagline]Instance \\[{i}][/]")
         schedulers[i].print_result()
         print_rule()
-    
+
     # Important informations about metrics
-    # The TTFT (Time to First Token) in our simulator differs from vllm. 
+    # The TTFT (Time to First Token) in our simulator differs from vllm.
     # While vllm measures TTFT as the time when the client receives the first token,
     # Our simulator measures it as the time when the computation of the first token is completed.
     # Therefore, vllm gets much more higher TTFT.
@@ -1033,9 +1084,9 @@ def main():
 
     if args.cleanup_inputs:
         _cleanup_inputs_root(run_paths, logger)
-    
 
-if __name__ == "__main__": 
+
+if __name__ == "__main__":
     # For simulation time breakdown
     # profiler = Profiler()
     # profiler.start()

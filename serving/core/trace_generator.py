@@ -4,7 +4,7 @@ from .request import *
 from .utils import *
 import pandas as pd
 import yaml
-from .memory_model import calculate_sizes
+from .memory_model import calculate_sizes, calculate_expert_sizes
 from .gate_function import GateRouter
 from .config_builder import get_device
 from .power_model import PowerModel, total_ring_data
@@ -111,6 +111,7 @@ class TraceCtx:
     tp_dim: list       # involved_dim for TP collectives (ALLREDUCE), None = all dims
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
+    expert_offload_config: object = None  # ExpertOffloadConfig or None; consumed by Phase E expert-PIM trace generation.
 
 
 @dataclass
@@ -127,6 +128,42 @@ class BatchCtx:
     lm_head_len: int    # number of sequences
     decode_lens: list   # per-PIM-channel decode lengths (None if no PIM)
     channel_split: int  # PIM channel split factor
+    expert_offload_active: bool = False  # True only when decode-stage gating permits expert PIM offload.
+
+
+@dataclass
+class ExpertPIMWorkItem:
+    """A cold expert's PIM-side work for one MoE layer and batch.
+
+    To create ``PIM`` markers and converter-visible expert nodes.
+    """
+    layer: int
+    expert_id: int
+    tokens: int
+    input_bytes: int
+    weight_bytes: int
+    output_bytes: int
+    bytes_total: int
+    channel: object
+    runtime_ns: int
+    active_cold_experts: int
+
+
+@dataclass
+class ExpertOffloadSplit:
+    """Hot/cold split of one routed MoE layer."""
+    cold_expert_ids: list
+    hot_local_tokens: list
+    hot_activated_experts: list
+    hot_expert_ids_by_rank: list
+    cold_work_items: list
+    hot_pairs: int
+    cold_pairs: int
+    total_pairs: int
+    cold_input_transfer_bytes: int = 0
+    cold_output_transfer_bytes: int = 0
+    input_transfer_ns: int = 0
+    output_transfer_ns: int = 0
 
 
 @dataclass
@@ -144,9 +181,11 @@ class PowerAccumulator:
         ctx.power_model.add_link_energy_consumption(ctx.node_id, self.link_data_bytes)
         for lat in self.npu_latencies_ns:
             ctx.power_model.add_npu_active_energy_consumption(ctx.hardware, ctx.node_id, lat, num_npus=ctx.tp_size)
-        if enable_attn_offloading:
-            for lat in self.pim_latencies_ns:
-                ctx.power_model.add_pim_active_energy_consumption(ctx.node_id, lat)
+        # PIM work may now come from attention offload or expert offload.
+        # The accumulator is empty in non-PIM traces, so charge PIM energy
+        # whenever a trace emitter recorded PIM runtime.
+        for lat in self.pim_latencies_ns:
+            ctx.power_model.add_pim_active_energy_consumption(ctx.node_id, lat)
 
 
 # ======================================================================
@@ -830,7 +869,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
                      placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                      variant, kv_cache_dtype='auto',
                      runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                     tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                     tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                     expert_offload_config=None):
     model_type = config.get('model_type')
     if not model_type:
         raise KeyError(
@@ -848,8 +888,10 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
     head_dim = config.get('head_dim', n_embd // n_head)
     is_moe = gate is not None
 
+    expert_cfg_enabled = bool(
+        expert_offload_config is not None and getattr(expert_offload_config, "enabled", False))
     pim_channels = 0
-    if enable_attn_offloading and pim_model is not None:
+    if (enable_attn_offloading or expert_cfg_enabled) and pim_model is not None:
         pim_config = pim_model.get_config()
         pim_channels = int(pim_config["mem_size"] // pim_config["dimm_size"])
 
@@ -863,6 +905,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
         pd_type=pd_type,
         tp_size=tp_size, pp_size=pp_size, local_ep=local_ep, ep_total=ep_total,
         tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+        expert_offload_config=expert_offload_config,
     )
 
 
@@ -901,9 +944,11 @@ def _build_batch_ctx(batch, ctx):
         kv_decode_min = 0
         total_len = max(1, total_len)  # preserve for size calcs
 
-    return BatchCtx(batch, total_len, prefill_chunk, kv_prefill, n_decode,
+    bctx = BatchCtx(batch, total_len, prefill_chunk, kv_prefill, n_decode,
                     kv_decode_mean, kv_decode_max, kv_decode_min,
                     lm_head_len, decode_lens, channel_split)
+    bctx.expert_offload_active = _is_expert_offload_active(ctx, bctx)
+    return bctx
 
 
 # ======================================================================
@@ -1005,11 +1050,404 @@ def _emit_pim_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
     lines.append("PIM END\n")
 
 
+def _emit_pim_expert_work_items(ctx, lines, power_acc, work_items):
+    """Emit PIM trace rows for cold MoE expert work items.
+
+    Rows are grouped by assigned PIM channel using the same marker convention
+    as attention PIM. Any unassigned work item is assigned here as a defensive
+    fallback; the normal path assigns channels during the hot/cold split.
+    """
+    if not work_items:
+        return
+
+    work_items = _assign_pim_expert_channels(ctx, work_items)
+
+    # The Chakra converter currently treats the PIM marker id as an NPU-local
+    # scheduling selector, while the actual PIM memory channel is carried by
+    # REMOTE:<node>.<channel> and converted into tensor_channel. Nonzero expert
+    # PIM markers are not converter-safe yet, so keep the marker on channel 0
+    # and encode the assigned PIM channel in the row memory locations.
+    converter_marker_channel = _validate_pim_channel(ctx, 0, '*', '*')
+    ordered = []
+    for item in work_items:
+        ch = int(item.channel)
+        _validate_pim_channel(ctx, ch, item.layer, item.expert_id)
+        ordered.append(item)
+    ordered.sort(key=lambda item: (
+        int(item.channel), int(item.layer), int(item.expert_id), -int(item.tokens)))
+
+    lines.append(f"PIM {converter_marker_channel}\n")
+    for item in ordered:
+        ch = int(item.channel)
+        remote = f'REMOTE:{ctx.node_id}.{ch}'
+        # ``pim_moe.csv`` is already the CPU/PIM-visible expert
+        # runtime. NPU<->CPU/PIM activation movement is modeled explicitly
+        # with xfer_in/xfer_out rows, and cold expert weights are resident in
+        # PIM.  The ASTRA analytical PIM backend adds memory service time for
+        # a PIM_COMP_NODE's tensor_size, which the converter derives from
+        # input_size + output_size.  Emit zero PIM tensor sizes for expert-PIM
+        # rows so the backend charges exactly the CSV profile runtime here.
+        lines.append(formatter(
+            f"expert_pim_L{item.layer}_E{item.expert_id}",
+            str(item.runtime_ns),
+            remote, '0',
+            remote, str(item.weight_bytes),
+            remote, '0',
+            'NONE', '0', 'EXPERT'))
+        if power_acc is not None and item.runtime_ns > 0:
+            power_acc.pim_latencies_ns.append(item.runtime_ns)
+            power_acc.dram_weight_bytes += item.bytes_total
+    lines.append("PIM END\n")
+
+
+def _emit_pim_expert_transfer_row(ctx, lines, *, name, latency_ns, transfer_bytes, direction):
+    """Emit an explicit NPU<->CPU/PIM activation-transfer dependency row.
+
+    Expert-PIM transfers are tagged so the Chakra converter maps them to
+    PIM-side runtime nodes rather than GPU COMP_NODEs. Activation byte counts
+    remain visible in the text trace for inspection; converted PIM transfer
+    nodes use zero tensor size so the explicit latency below is charged exactly.
+    """
+    remote = f'REMOTE:{ctx.node_id}.0'
+    misc = 'PIM_XFER_IN' if direction == 'in' else 'PIM_XFER_OUT'
+    lines.append(formatter(
+        name, str(int(latency_ns)),
+        remote, str(int(transfer_bytes)),
+        remote, '0',
+        remote, str(int(transfer_bytes)),
+        'NONE', '0', misc))
+
+
 def _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'):
     """Emit NPU attention (unified prefill+decode lookup)."""
     if bctx.prefill_chunk == 0 and bctx.n_decode == 0:
         return
     _emit_layer(ctx, bctx, "attention", lines, power_acc, batch_tag, layer_num)
+
+
+def _batch_has_decode_tokens(bctx):
+    """Return True when the original batch contains decode tokens.
+
+    Attention PIM can zero ``bctx.n_decode`` for the NPU attention lookup, so
+    expert-offload gating must inspect the raw Batch fields kept in ``bctx``.
+    """
+    batch = bctx.batch
+    return bool(getattr(batch, "num_decode", 0) > 0 or getattr(batch, "decode_k_list", []))
+
+
+def _validate_active_expert_offload_config(ctx):
+    cfg = ctx.expert_offload_config
+    missing = []
+    if getattr(cfg, "cold_experts_csv", None) is None:
+        missing.append("cold_experts_csv")
+    if getattr(cfg, "routing_distribution_csv", None) is None:
+        missing.append("routing_distribution_csv")
+    if getattr(cfg, "pim_expert_profile_csv", None) is None:
+        missing.append("pim_expert_profile_csv")
+    if getattr(cfg, "pim_profile_time_semantics", None) is None:
+        missing.append("pim_profile_time_semantics")
+    if getattr(cfg, "activation_transfer", None) is None:
+        missing.append("activation_transfer")
+    if missing:
+        raise ValueError(
+            "expert offload is active for this decode MoE batch, but "
+            f"expert_offload is missing required field(s): {', '.join(missing)}; "
+            "set expert_offload.activation_transfer with NPU<->CPU/PIM bandwidth and latency")
+    if ctx.pim_model is None or ctx.pim_channels <= 0:
+        raise ValueError(
+            "expert offload is active for this decode MoE batch, but PIM memory "
+            "is not configured; set cpu_mem.pim_config when enable_expert_offloading is true")
+
+
+def _is_expert_offload_active(ctx, bctx):
+    """Return whether expert PIM offload should apply to this batch.
+
+    E2 intentionally gates only the stage.  The actual hot/cold split and PIM
+    expert row emission are implemented by later Phase E tasks.  Prefill and
+    colocated instances remain NPU-only in this first implementation.
+    """
+    cfg = ctx.expert_offload_config
+    if cfg is None or not getattr(cfg, "enabled", False):
+        return False
+    if not ctx.is_moe:
+        return False
+    apply_to = set(getattr(cfg, "apply_to", ()) or ())
+    if "decode" not in apply_to:
+        return False
+    if ctx.pd_type == "prefill":
+        return False
+    if ctx.pd_type not in (None, "decode"):
+        return False
+    if not _batch_has_decode_tokens(bctx):
+        return False
+    _validate_active_expert_offload_config(ctx)
+    return True
+
+
+def _num_moe_experts(ctx):
+    num_experts = ctx.config.get('num_local_experts', ctx.config.get('num_experts'))
+    if num_experts is None and ctx.gate is not None:
+        num_experts = getattr(ctx.gate, 'E', None)
+    if num_experts is None:
+        raise ValueError("expert offload requires model metadata num_local_experts/num_experts")
+    num_experts = int(num_experts)
+    if num_experts <= 0:
+        raise ValueError(f"expert offload requires a positive expert count, got {num_experts}")
+    return num_experts
+
+
+def _num_experts_per_tok(ctx):
+    k = ctx.config.get('num_experts_per_tok')
+    if k is None and ctx.gate is not None:
+        k = getattr(ctx.gate, 'k', None)
+    if k is None:
+        k = 1
+    k = int(k)
+    if k <= 0:
+        raise ValueError(f"num_experts_per_tok must be positive, got {k}")
+    return k
+
+
+def _expert_owner(ctx, expert_id, num_experts):
+    if ctx.gate is not None and hasattr(ctx.gate, 'expert_owner'):
+        return ctx.gate.expert_owner(expert_id, ctx.ep_total, num_experts)
+    return min(int(expert_id * ctx.ep_total // num_experts), ctx.ep_total - 1)
+
+
+def _expert_offload_resources(ctx):
+    """Load and cache expert-offload CSV resources on the trace context."""
+    cached = getattr(ctx, '_expert_offload_resources_cache', None)
+    if cached is not None:
+        return cached
+
+    cfg = ctx.expert_offload_config
+    num_experts = _num_moe_experts(ctx)
+    num_layers = ctx.config.get('num_hidden_layers')
+    num_layers = int(num_layers) if num_layers is not None else None
+
+    manifest = cfg.load_manifest(num_experts=num_experts, num_layers=num_layers)
+    distribution = cfg.load_distribution(num_experts=num_experts, num_layers=num_layers)
+    profile_db = cfg.load_profile_db()
+    cached = (manifest, distribution, profile_db)
+    setattr(ctx, '_expert_offload_resources_cache', cached)
+    return cached
+
+
+def _validate_pim_channel(ctx, channel, layer_num, expert_id):
+    if channel is None:
+        return None
+    channel = int(channel)
+    if channel < 0 or channel >= ctx.pim_channels:
+        raise ValueError(
+            f"expert offload layer {layer_num} expert {expert_id}: channel {channel} "
+            f"out of range for pim_channels={ctx.pim_channels}")
+    return channel
+
+
+def _pim_expert_channel_load(item):
+    """Return the deterministic load metric used for greedy PIM bin packing."""
+    runtime_ns = max(0, int(getattr(item, 'runtime_ns', 0) or 0))
+    if runtime_ns > 0:
+        return runtime_ns
+    return max(0, int(getattr(item, 'tokens', 0) or 0))
+
+
+def _assign_pim_expert_channels(ctx, work_items):
+    """Assign cold expert work to PIM channels.
+
+    ``channel_policy=greedy_load`` sorts unpinned work by estimated runtime
+    descending, then assigns each item to the channel with the lowest
+    accumulated load. Explicit manifest channels are validated, preserved, and
+    counted as pre-existing load before unpinned work is placed.
+    """
+    work_items = list(work_items or [])
+    if not work_items:
+        return work_items
+    if ctx.pim_channels <= 0:
+        raise ValueError("expert offload has cold PIM work, but pim_channels is not positive")
+
+    cfg = getattr(ctx, 'expert_offload_config', None)
+    policy = getattr(cfg, 'channel_policy', 'greedy_load') if cfg is not None else 'greedy_load'
+    if policy != 'greedy_load':
+        raise ValueError(f"unsupported expert_offload.channel_policy {policy!r}")
+
+    loads = [0 for _ in range(ctx.pim_channels)]
+    floating = []
+    for index, item in enumerate(work_items):
+        if item.channel is None:
+            floating.append((index, item))
+            continue
+        ch = _validate_pim_channel(ctx, item.channel, item.layer, item.expert_id)
+        item.channel = ch
+        loads[ch] += _pim_expert_channel_load(item)
+
+    floating.sort(key=lambda pair: (
+        -_pim_expert_channel_load(pair[1]),
+        -int(getattr(pair[1], 'tokens', 0) or 0),
+        int(getattr(pair[1], 'layer', 0) or 0),
+        int(getattr(pair[1], 'expert_id', 0) or 0),
+        pair[0],
+    ))
+    for _, item in floating:
+        ch = min(range(ctx.pim_channels), key=lambda idx: (loads[idx], idx))
+        item.channel = ch
+        loads[ch] += _pim_expert_channel_load(item)
+
+    logger.debug("Assigned PIM expert channel loads: %s", loads)
+    return work_items
+
+
+def _calculate_hot_moe_sizes(ctx, tokens, activated_experts):
+    """Tensor sizes for the NPU-resident hot part of a split MoE layer."""
+    inp, _, out = calculate_sizes(ctx.model, "moe", tokens, parallel=ctx.ep_total, fp=ctx.fp)
+    _, one_expert_wt, _ = calculate_expert_sizes(ctx.model, 0, fp=ctx.fp)
+    gate_wt = int(ctx.config['hidden_size']) * _num_moe_experts(ctx) * ctx.fp
+    wt = gate_wt + max(int(activated_experts), 0) * one_expert_wt
+    return inp, wt, out
+
+
+def _split_expert_offload_work(ctx, bctx, routing, layer_num):
+    """Split detailed routing counts into hot NPU work and cold PIM work.
+
+    This consumes ``RoutingResult.per_expert_tokens`` and
+    the count-based cold manifest, then returns NPU MoE lookup keys for hot
+    experts plus PIM work-item records for cold experts.
+    """
+    num_experts = _num_moe_experts(ctx)
+    if routing.per_expert_tokens is None:
+        raise ValueError("expert offload requires RoutingResult.per_expert_tokens")
+    per_expert_tokens = [int(v) for v in routing.per_expert_tokens]
+    if len(per_expert_tokens) != num_experts:
+        raise ValueError(
+            f"routing produced {len(per_expert_tokens)} expert counts, but model has {num_experts} experts")
+
+    manifest, distribution, profile_db = _expert_offload_resources(ctx)
+    rule = manifest.count_rule_for_layer(int(layer_num))
+    cold_expert_ids = manifest.cold_expert_ids_for_layer(
+        int(layer_num), distribution, num_experts=num_experts)
+    if len(cold_expert_ids) != rule.experts_in_pim:
+        raise AssertionError(
+            f"cold expert invariant failed for layer {layer_num}: derived {len(cold_expert_ids)} ids, "
+            f"manifest count is {rule.experts_in_pim}")
+
+    k = _num_experts_per_tok(ctx)
+    expected_pairs = int(bctx.total_len) * k
+    total_pairs = sum(per_expert_tokens)
+    if total_pairs != expected_pairs:
+        raise AssertionError(
+            f"expert offload routing invariant failed for layer {layer_num}: "
+            f"sum(per_expert_tokens)={total_pairs}, expected total_len*k={expected_pairs}")
+
+    cold_set = set(cold_expert_ids)
+    hot_pairs_by_rank = [0 for _ in range(ctx.ep_total)]
+    hot_expert_ids_by_rank = [set() for _ in range(ctx.ep_total)]
+    cold_counts = {}
+    hot_pairs = 0
+    cold_pairs = 0
+
+    for expert_id, tokens in enumerate(per_expert_tokens):
+        if tokens < 0:
+            raise ValueError(f"routing produced negative token count for expert {expert_id}: {tokens}")
+        if expert_id in cold_set:
+            cold_pairs += tokens
+            if tokens > 0:
+                cold_counts[expert_id] = tokens
+            continue
+        hot_pairs += tokens
+        if tokens > 0:
+            owner = _expert_owner(ctx, expert_id, num_experts)
+            hot_pairs_by_rank[owner] += tokens
+            hot_expert_ids_by_rank[owner].add(expert_id)
+
+    if hot_pairs + cold_pairs != expected_pairs:
+        raise AssertionError(
+            f"expert offload split invariant failed for layer {layer_num}: "
+            f"hot_pairs({hot_pairs}) + cold_pairs({cold_pairs}) != {expected_pairs}")
+    for rank, expert_ids in enumerate(hot_expert_ids_by_rank):
+        overlap = expert_ids & cold_set
+        if overlap:
+            raise AssertionError(
+                f"expert offload split invariant failed for layer {layer_num}, rank {rank}: "
+                f"cold expert(s) present in hot set: {sorted(overlap)}")
+
+    if not cold_counts:
+        # Acceptance requirement: if selected cold experts receive no tokens,
+        # the NPU trace is byte-for-byte the normal MoE path (apart from logs).
+        return ExpertOffloadSplit(
+            cold_expert_ids=cold_expert_ids,
+            hot_local_tokens=list(routing.local_tokens),
+            hot_activated_experts=list(routing.activated_experts),
+            hot_expert_ids_by_rank=[set(s) for s in hot_expert_ids_by_rank],
+            cold_work_items=[],
+            hot_pairs=hot_pairs,
+            cold_pairs=0,
+            total_pairs=total_pairs,
+            cold_input_transfer_bytes=0,
+            cold_output_transfer_bytes=0,
+            input_transfer_ns=0,
+            output_transfer_ns=0,
+        )
+
+    hot_local_tokens = [min(int(bctx.total_len), pairs) if pairs > 0 else 0
+                        for pairs in hot_pairs_by_rank]
+    hot_activated_experts = [len(s) for s in hot_expert_ids_by_rank]
+    active_cold_experts = len(cold_counts)
+    channel = _validate_pim_channel(ctx, rule.channel, layer_num, '*')
+
+    cold_work_items = []
+    for expert_id in cold_expert_ids:
+        tokens = cold_counts.get(expert_id, 0)
+        if tokens <= 0:
+            continue
+        inp, wt, out = calculate_expert_sizes(ctx.model, tokens, fp=ctx.fp)
+        runtime_ns = profile_db.lookup_ns(tokens, active_cold_experts)
+        cold_work_items.append(ExpertPIMWorkItem(
+            layer=int(layer_num),
+            expert_id=int(expert_id),
+            tokens=int(tokens),
+            input_bytes=int(inp),
+            weight_bytes=int(wt),
+            output_bytes=int(out),
+            bytes_total=int(inp + wt + out),
+            channel=channel,
+            runtime_ns=int(runtime_ns),
+            active_cold_experts=active_cold_experts,
+        ))
+
+    cold_work_items = _assign_pim_expert_channels(ctx, cold_work_items)
+
+    transfer_cfg = getattr(ctx.expert_offload_config, 'activation_transfer', None)
+    if transfer_cfg is None:
+        raise ValueError(
+            "expert offload has active cold expert work, but expert_offload.activation_transfer is missing")
+    cold_input_transfer_bytes = sum(int(item.input_bytes) for item in cold_work_items)
+    cold_output_transfer_bytes = sum(int(item.output_bytes) for item in cold_work_items)
+    input_transfer_ns = transfer_cfg.npu_to_pim_time_ns(cold_input_transfer_bytes)
+    output_transfer_ns = transfer_cfg.pim_to_npu_time_ns(cold_output_transfer_bytes)
+
+    logger.info(
+        "Expert offload split: layer=%d cold_ids=%s active_cold=%d hot_pairs=%d cold_pairs=%d "
+        "hot_tokens=%s hot_activated=%s transfer_in_bytes=%d transfer_out_bytes=%d "
+        "transfer_in_ns=%d transfer_out_ns=%d",
+        int(layer_num), cold_expert_ids, active_cold_experts, hot_pairs, cold_pairs,
+        hot_local_tokens, hot_activated_experts, cold_input_transfer_bytes,
+        cold_output_transfer_bytes, input_transfer_ns, output_transfer_ns,
+    )
+
+    return ExpertOffloadSplit(
+        cold_expert_ids=cold_expert_ids,
+        hot_local_tokens=hot_local_tokens,
+        hot_activated_experts=hot_activated_experts,
+        hot_expert_ids_by_rank=hot_expert_ids_by_rank,
+        cold_work_items=cold_work_items,
+        hot_pairs=hot_pairs,
+        cold_pairs=cold_pairs,
+        total_pairs=total_pairs,
+        cold_input_transfer_bytes=cold_input_transfer_bytes,
+        cold_output_transfer_bytes=cold_output_transfer_bytes,
+        input_transfer_ns=input_transfer_ns,
+        output_transfer_ns=output_transfer_ns,
+    )
 
 
 def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag='NONE'):
@@ -1028,6 +1466,15 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     # the same per-rank padded value as every other dense layer.
     effective_total_len_compute = bctx.total_len
     routing = ctx.gate.route_ep(layer_num, batch_id_str, effective_total_len_compute, ep_total)
+    moe_local_tokens = routing.local_tokens
+    moe_activated_experts = routing.activated_experts
+    expert_split = None
+    active_cold_work = False
+    if bctx.expert_offload_active:
+        expert_split = _split_expert_offload_work(ctx, bctx, routing, layer_num)
+        moe_local_tokens = expert_split.hot_local_tokens
+        moe_activated_experts = expert_split.hot_activated_experts
+        active_cold_work = bool(expert_split.cold_work_items)
 
     # AG/RS comm sizes are anchored to ``dp_sum_total_len``, which
     # ``serving/__main__.py`` sets to ``max_total_len`` (NOT ``max × dp_group_size``)
@@ -1069,6 +1516,35 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     if power_acc is not None and ep_total > 1:
         power_acc.link_data_bytes += total_ring_data(dispatch_comm_size, ep_total, collective="allgather")
 
+    def emit_cold_pim_path_once():
+        if not active_cold_work or expert_split is None:
+            return
+        _emit_pim_expert_transfer_row(
+            ctx,
+            lines,
+            name=f"xfer_in_L{layer_num}",
+            latency_ns=expert_split.input_transfer_ns,
+            transfer_bytes=expert_split.cold_input_transfer_bytes,
+            direction="in",
+        )
+        _emit_pim_expert_work_items(ctx, lines, power_acc, expert_split.cold_work_items)
+        _emit_pim_expert_transfer_row(
+            ctx,
+            lines,
+            name=f"xfer_out_L{layer_num}",
+            latency_ns=expert_split.output_transfer_ns,
+            transfer_bytes=expert_split.cold_output_transfer_bytes,
+            direction="out",
+        )
+        # Keep the expert combine/next layer behind cold transfer and PIM
+        # compute. The converter makes the output-transfer row depend on
+        # preceding PIM nodes; EXPERT END then depends on this one-cycle join
+        # row. The row is a dependency fence, not material expert work.
+        lines.append(formatter(
+            "expert_pim_join", "1",
+            'LOCAL', '0', 'LOCAL', '0', 'LOCAL', '0',
+            'NONE', '0', 'NONE'))
+
     for i in range(emit_ep):
         if i == 0:
             lines.append(f"EXPERT {i} {dispatch_comm_type} {dispatch_comm_size}\n")
@@ -1078,20 +1554,34 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
         # ``local_tokens`` here is the per-rank workload after dispatch
         # — already scaled to this rank's real tokens (no DP-padding sum).
         # We feed it straight into the MoE profile lookup.
-        local_tokens = routing.local_tokens[i]
-        activated_experts = routing.activated_experts[i]
+        local_tokens = moe_local_tokens[i] if i < len(moe_local_tokens) else 0
+        activated_experts = moe_activated_experts[i] if i < len(moe_activated_experts) else 0
 
         if local_tokens > 0:
             rank_latency_ns = _lookup_moe(ctx.perf_db, local_tokens, max(activated_experts, 1))
-            rank_inp, rank_wt, rank_out = calculate_sizes(
-                ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp)
+            if active_cold_work:
+                rank_inp, rank_wt, rank_out = _calculate_hot_moe_sizes(
+                    ctx, local_tokens, activated_experts)
+            else:
+                rank_inp, rank_wt, rank_out = calculate_sizes(
+                    ctx.model, "moe", local_tokens, parallel=ep_total, fp=ctx.fp)
             max_rank_latency_ns = max(max_rank_latency_ns, rank_latency_ns)
 
-            lines.append(formatter("expert", str(rank_latency_ns), 'LOCAL', str(rank_inp),
+            expert_row_name = "expert_hot" if active_cold_work else "expert"
+            lines.append(formatter(expert_row_name, str(rank_latency_ns), 'LOCAL', str(rank_inp),
                 wt_loc, str(rank_wt), 'LOCAL', str(rank_out), 'NONE', '0', batch_tag))
 
             if power_acc is not None and wt_loc != 'LOCAL':
                 power_acc.dram_weight_bytes += rank_wt
+
+        # The Chakra converter assigns rows between ``EXPERT i`` markers to
+        # NPU ``i``. Expert-PIM rows use converter marker ``PIM 0`` for safety,
+        # so emit the cold PIM fork/join inside the ``EXPERT 0`` section. This
+        # keeps multi-local-EP traces collective-safe: rank 0 waits for PIM
+        # before ``EXPERT END``, while other ranks wait for their hot work and
+        # then enter the same combine collective order.
+        if i == 0:
+            emit_cold_pim_path_once()
 
     # Power: all local GPUs are active for the duration of the slowest rank
     if power_acc is not None and max_rank_latency_ns > 0:
@@ -1268,6 +1758,23 @@ def _emit_pp_pd_power(ctx, bctx):
 # _synthesize_trace (non-interleaved)
 # ======================================================================
 
+def _block_replay_counts(ctx, num_layers, block_mode_on):
+    """Return (layers_to_build, replay_count_per_built_layer).
+
+    When block replay is safe, build layer 0 once and replay it for every
+    transformer layer.  When replay is unsafe (placement block mode, CUSTOM
+    layer-specific routing, or an explicit --no-enable-block-copy), build every
+    layer separately so layer_num-sensitive routing/offload decisions are visible
+    in the trace.
+    """
+
+    can_replay = (
+        not block_mode_on
+        and (not ctx.is_moe or (ctx.gate is not None and ctx.gate.block_copy))
+    )
+    return (1, num_layers) if can_replay else (num_layers, 1)
+
+
 def _emit_prologue(ctx, bctx, f, batch_tag='NONE'):
     """Emit prologue layers (typically just embedding). The first layer's
     input is routed from REMOTE to match the Chakra converter's
@@ -1296,13 +1803,15 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
                       enable_attn_offloading, power_model, pim_model, fp,
                       variant, kv_cache_dtype='auto',
                       runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                      tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                      tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                      expert_offload_config=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                           expert_offload_config=expert_offload_config)
     bctx = _build_batch_ctx(batch, ctx)
 
     logger.info(
@@ -1317,21 +1826,11 @@ def _synthesize_trace(hardware, model, config, tp_size, pp_size, local_ep, ep_to
 
         # Transformer blocks
         num_layers = config['num_hidden_layers']
-        iter_count, copy_count = (num_layers, 1) if block_mode_on else (1, num_layers)
+        iter_count, copy_count = _block_replay_counts(ctx, num_layers, block_mode_on)
 
         for layer_num in range(iter_count):
             block_lines, block_power = _build_transformer_block(ctx, bctx, layer_num, 'NONE', str(batch.batch_id))
-
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
-            if can_copy:
-                for _ in range(copy_count):
-                    f.writelines(block_lines)
-                    block_power.flush(ctx, enable_attn_offloading)
-            else:
+            for _ in range(copy_count):
                 f.writelines(block_lines)
                 block_power.flush(ctx, enable_attn_offloading)
 
@@ -1349,13 +1848,15 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
                                   enable_attn_offloading, power_model, pim_model, fp,
                                   variant, kv_cache_dtype='auto',
                                   runtime_max_num_batched_tokens=None, runtime_max_num_seqs=None,
-                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0):
+                                  tp_dim=None, ep_dim=None, dp_sum_total_len=0,
+                                  expert_offload_config=None):
     ctx = _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_total, node_id, fp,
                            placement, gate, enable_attn_offloading, power_model, pim_model, pd_type,
                            variant=variant, kv_cache_dtype=kv_cache_dtype,
                            runtime_max_num_batched_tokens=runtime_max_num_batched_tokens,
                            runtime_max_num_seqs=runtime_max_num_seqs,
-                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                           tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                           expert_offload_config=expert_offload_config)
     bctx1 = _build_batch_ctx(batches[0], ctx)
     bctx2 = _build_batch_ctx(batches[1], ctx)
 
@@ -1395,7 +1896,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
 
         # MIDDLE LAYERS: interleaved post_attn + pre_attn
         middle_layers = num_layers - 1
-        iter_count, copy_count = (middle_layers, 1) if block_mode_on else (1, middle_layers)
+        iter_count, copy_count = _block_replay_counts(ctx, middle_layers, block_mode_on)
 
         for layer_num in range(iter_count):
             block_lines = []
@@ -1409,16 +1910,7 @@ def _synthesize_interleaved_trace(hardware, model, config, tp_size, pp_size, loc
             _emit_post_attn_layers(ctx, bctx2, layer_num, block_lines, block_power, f"{batches[1].batch_id}.1", 'BATCH_2')
             _emit_pre_attn_layers(ctx, bctx2, layer_num + 1, block_lines, block_power, 'BATCH_2')
 
-            # MoE blocks are only safely replayable when the router
-            # opts into block copy (BALANCED is deterministic; others
-            # carry tiny per-layer variance that block_copy swallows
-            # for the sake of trace-generation speed).
-            can_copy = (not ctx.is_moe or ctx.gate.block_copy) and not block_mode_on
-            if can_copy:
-                for _ in range(copy_count):
-                    f.writelines(block_lines)
-                    block_power.flush(ctx, enable_attn_offloading)
-            else:
+            for _ in range(copy_count):
                 f.writelines(block_lines)
                 block_power.flush(ctx, enable_attn_offloading)
 
@@ -1450,7 +1942,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                    placement={}, block_mode_on=False, expert_routing_policy="BALANCED",
                    enable_prefix_caching=False, enable_attn_offloading=False, power_model=None, pim_model=None,
                    enable_sub_batch_interleaving=False, fp=16, dtype=None, kv_cache_dtype='auto',
-                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None):
+                   tp_dim=None, ep_dim=None, dp_sum_total_len=0, enable_block_copy=True, inputs_root=None,
+                   expert_routing_distribution_csv=None, expert_offload_config=None):
 
     model = batch.model
     config = get_config(model)
@@ -1481,6 +1974,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
             routing_policy=expert_routing_policy,
             seed=42,
             block_copy=enable_block_copy,
+            routing_distribution_csv=expert_routing_distribution_csv,
+            num_layers=config.get('num_hidden_layers'),
         )
     else:
         gate = None
@@ -1501,7 +1996,8 @@ def generate_trace(batch, hardware, tp_size, pp_size, local_ep, ep_total, pd_typ
                         variant=variant, kv_cache_dtype=kv_cache_dtype,
                         runtime_max_num_batched_tokens=max_num_batched_tokens,
                         runtime_max_num_seqs=max_num_seqs,
-                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len)
+                        tp_dim=tp_dim, ep_dim=ep_dim, dp_sum_total_len=dp_sum_total_len,
+                        expert_offload_config=expert_offload_config)
     if not enable_sub_batch_interleaving:
         _synthesize_trace(*synth_args, batch, max_len, output_path, **synth_kwargs)
     else:

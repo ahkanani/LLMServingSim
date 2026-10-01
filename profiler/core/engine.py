@@ -30,6 +30,7 @@ from vllm import LLM
 from profiler.core import logger as log
 from profiler.core.config import (
     HOST_ENGINE_DEFAULTS,
+    MODEL_TYPE_ENGINE_OVERRIDES,
     SHARD_FIELDS,
     ProfileArgs,
     probe_moe_params,
@@ -155,6 +156,18 @@ def fuse_engine_kwargs(args: ProfileArgs, tp: int) -> dict[str, Any]:
     hf_overrides: dict[str, Any] = dict(
         HOST_ENGINE_DEFAULTS.get("hf_overrides", {})
     )
+    model_type = None
+    if args.model_config:
+        model_type = args.model_config.get("model_type")
+    model_specific = MODEL_TYPE_ENGINE_OVERRIDES.get(str(model_type), {})
+    if model_specific:
+        kwargs = _deep_merge(
+            kwargs,
+            {k: v for k, v in model_specific.items() if k != "hf_overrides"},
+        )
+        hf_overrides = _deep_merge(
+            hf_overrides, model_specific.get("hf_overrides", {})
+        )
     if args.hf_overrides:
         hf_overrides = _deep_merge(hf_overrides, args.hf_overrides)
 

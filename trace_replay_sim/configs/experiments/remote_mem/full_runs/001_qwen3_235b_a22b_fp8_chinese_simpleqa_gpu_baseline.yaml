@@ -1,0 +1,30 @@
+trace:
+  trace_pack_path: tracepacks/full/qwen3_235b_a22b_fp8/Chinese-SimpleQA
+  benchmark: Chinese-SimpleQA
+model:
+  config_path: ../../../models/qwen3_235b_a22b_fp8.yaml
+hardware:
+  config_path: ../../../hardware/8gpu_h200_remote_mem_bw09.yaml
+replay:
+  seed: 123
+  max_batch_size: 128
+  warmup_steps: 16
+  eval_steps: 5000
+run:
+  seed: 123
+  output_dir: runs/remote_mem/full_runs
+  run_id: remote_mem_qwen3_235b_a22b_fp8_chinese_simpleqa_gpu_baseline
+  overwrite: false
+predictor:
+  type: heuristic
+  horizon: 1
+  window_size: 128
+  decay: 0.95
+  use_prefill_context: false
+placement:
+  mode: all_gpu
+scheduler:
+  policy: gpu_baseline
+  oracle_comparison: true
+metrics:
+  level: summary

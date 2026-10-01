@@ -1,0 +1,43 @@
+# Small smoke config for adaptive fixed-after-warmup placement.
+trace:
+  trace_pack_path: tracepacks/full/qwen3_235b_a22b_fp8/mmlu
+  benchmark: mmlu
+
+model:
+  config_path: ../models/qwen3_235b_a22b_fp8.yaml
+
+hardware:
+  config_path: ../hardware/8gpu_16pim_mvp0.yaml
+
+replay:
+  seed: 123
+  max_batch_size: 32
+  warmup_steps: 128
+  eval_steps: 500
+
+run:
+  seed: 123
+  output_dir: runs/adaptive_extra_budget_smoke
+  run_id: qwen3_mmlu_adaptive_extra_budget_b32
+  overwrite: false
+
+predictor:
+  type: heuristic
+  horizon: 1
+  window_size: 128
+  decay: 0.95
+  use_prefill_context: false
+
+placement:
+  mode: adaptive_extra_budget
+  extra_copy_fraction: 0.25
+
+migration:
+  mode: none
+
+scheduler:
+  policy: placement_greedy
+  oracle_comparison: true
+
+metrics:
+  level: summary

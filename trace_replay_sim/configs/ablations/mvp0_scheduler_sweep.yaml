@@ -1,0 +1,10 @@
+# Tiny example sweep: expands configs without editing source code. Use --dry-run
+# first, then remove --dry-run or add --overwrite once run IDs are intentional.
+base_config: configs/experiments/mvp0_100req_debug.yaml
+sweep:
+  name: mvp0_scheduler
+  run_id_template: "{sweep_id}_{index:03d}_{params_slug}"
+  parameters:
+    scheduler.policy:
+      - placement_greedy
+      - gpu_baseline

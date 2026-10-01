@@ -72,7 +72,7 @@ Some model configs (e.g., Llama 3.x, gated Qwen variants) live behind
 HF authentication. The profiler can auto-fetch these if you set:
 
 ```bash
-export HF_TOKEN="hf_xxxxxxxxxxxxxxxxxxxxxxxxxx"
+export HF_TOKEN="<hugging-face-token>"
 ```
 
 You only need this if you plan to **profile** new models. Running

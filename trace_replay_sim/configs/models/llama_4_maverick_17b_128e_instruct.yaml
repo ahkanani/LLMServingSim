@@ -1,0 +1,19 @@
+model:
+  model_id: meta-llama/Llama-4-Maverick-17B-128E-Instruct
+  short_name: llama_4_maverick_17b_128e_instruct
+  family: Llama-4-Maverick
+  num_layers: 48
+  experts_per_layer: 128
+  top_k: 1
+  expert_weight_bytes: 125829120
+  metadata:
+    hidden_size: 5120
+    moe_intermediate_size: 8192
+    weight_dtype: fp8_assumed
+    expert_weight_formula: 3 * hidden_size * moe_intermediate_size * 1 byte
+    source_config: https://huggingface.co/unsloth/Llama-4-Maverick-17B-128E-Instruct-GGUF/blob/main/config.json
+    source_trace_pack: tracepacks/full/llama_4_maverick_17b_128e_instruct/mmlu/manifest.json
+    source_config_note: Open derivative config used for text_config dimensions because
+      the Meta config is gated; TracePack manifest fixes model_id, layer count, experts,
+      and top_k.
+    intermediate_size_mlp: 16384

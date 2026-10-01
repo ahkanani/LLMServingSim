@@ -1,0 +1,48 @@
+# Final MVP-0 smoke/research config over existing 100-request-per-benchmark TracePacks.
+# This config is intentionally debug-level so the run verifies timeline.parquet
+# and oracle-gap plumbing without scanning the full raw dataset.
+trace:
+  trace_pack_path_template: tracepacks/mvp0/qwen3_235b_a22b_fp8/{benchmark}
+  benchmarks:
+    - mmlu
+    - livecodebench
+
+model:
+  config_path: configs/models/qwen3_235b_a22b_fp8.yaml
+
+hardware:
+  config_path: configs/hardware/8gpu_16pim_mvp0.yaml
+
+replay:
+  seed: 123
+  max_batch_size: 16
+  warmup_steps: 100
+  eval_steps: null
+  limit_per_benchmark: 100
+
+run:
+  seed: 123
+  output_dir: runs
+  run_id: mvp0_100req_debug_{benchmark}
+  overwrite: false
+
+predictor:
+  type: heuristic
+  horizon: 1
+  window_size: 32
+  decay: 1.0
+  use_prefill_context: false
+
+placement:
+  mode: static_hot_cold
+  hot_fraction: 0.50
+  cold_fraction: 0.25
+  warmup_weight: 1.0
+  prediction_weight: 1.0
+
+scheduler:
+  policy: placement_greedy
+  oracle_comparison: true
+
+metrics:
+  level: debug

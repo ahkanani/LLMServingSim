@@ -9,6 +9,9 @@ __pycache__/
 # Ignore pkl files
 *.pkl
 
+# Ignore backup files
+*.bk
+
 # Ignore bench results
 bench/results/
 
@@ -19,3 +22,7 @@ bench/results/
 .copilot/
 .aider*
 .continue/
+outputs/*/
+outputs/**/__pycache__/
+outputs/**/*.pyc
+bench/outputs/

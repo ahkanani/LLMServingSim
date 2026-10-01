@@ -1,0 +1,35 @@
+# Standard full-run config over one full TracePack.
+trace:
+  trace_pack_path: tracepacks/full/kimi_k2_thinking/Chinese-SimpleQA
+  benchmark: Chinese-SimpleQA
+model:
+  config_path: ../../models/kimi_k2_thinking.yaml
+hardware:
+  config_path: ../../hardware/8gpu_16pim_mvp0.yaml
+replay:
+  seed: 123
+  max_batch_size: 128
+  warmup_steps: 256
+  eval_steps: null
+run:
+  seed: 123
+  output_dir: runs/standard_full_runs
+  run_id: full_kimi_k2_thinking_chinese_simpleqa
+  overwrite: false
+predictor:
+  type: heuristic
+  horizon: 1
+  window_size: 128
+  decay: 0.95
+  use_prefill_context: false
+placement:
+  mode: static_hot_cold
+  hot_fraction: 0.5
+  cold_fraction: 0.25
+  warmup_weight: 1.0
+  prediction_weight: 1.0
+scheduler:
+  policy: placement_greedy
+  oracle_comparison: true
+metrics:
+  level: summary

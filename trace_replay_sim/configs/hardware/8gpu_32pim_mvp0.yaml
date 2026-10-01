@@ -1,0 +1,11 @@
+hardware:
+  hardware_id: 8gpu_32pim_mvp0
+  description: 8 GPUs + 32 PIM pkgs.
+  gpu_count: 8
+  gpu_bw_tbps_each: 4.0
+  pim_count: 32
+  pim_bw_tbps_each: 0.6
+  pim_granularity: 1
+  metadata:
+    base_gpu_bw_tbps_each: 4.0
+    base_pim_bw_tbps_each: 0.6

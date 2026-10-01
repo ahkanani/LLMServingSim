@@ -1,0 +1,23 @@
+base_config: configs/experiments/remote_mem/full_runs/008_qwen3_235b_a22b_fp8_mmlu_remote_mem_bw09.yaml
+sweep:
+  name: remote_mem_sensitivity
+  output_dir: runs/remote_mem/sweeps
+  run_id_template: '{sweep_id}_{index:03d}_{params_slug}'
+  parameters:
+    placement.hot_fraction:
+    - 0.25
+    - 0.5
+    - 0.75
+    placement.cold_fraction:
+    - 0.25
+    - 0.0
+    hardware.config_path:
+    - configs/hardware/8gpu_h200_remote_mem_bw045.yaml
+    - configs/hardware/8gpu_h200_remote_mem_bw09.yaml
+    - configs/hardware/8gpu_h200_remote_mem_bw18.yaml
+    replay.max_batch_size:
+    - 32
+    - 64
+    - 128
+    replay.eval_steps:
+    - 5000

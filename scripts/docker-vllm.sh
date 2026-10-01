@@ -27,9 +27,11 @@ docker run --name vllm_docker \
   -it \
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -v "$REPO_ROOT":/workspace \
-  --volume "$HOME/.cache/huggingface":/root/.cache/huggingface \
+  --volume "${HF_HOME:-$HOME/.cache/huggingface}":/root/.cache/huggingface \
   --shm-size=16g \
   -w /workspace \
   --entrypoint /bin/bash \
-  vllm/vllm-openai:v0.19.0 \
-  -c "pip install datasets matplotlib && exec bash"
+  vllm/vllm-openai:v0.19.0
+
+
+  # -c "pip install datasets matplotlib && exec bash"

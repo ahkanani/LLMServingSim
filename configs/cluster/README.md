@@ -46,6 +46,7 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | `num_nodes` | Integer | Number of nodes in the cluster |
 | `link_bw` | Float or Array<Float> | ASTRA-Sim topology link bandwidth in GB/s. A scalar is broadcast to all topology dimensions; an array must match the final `npus_count` rank |
 | `link_latency` | Float or Array<Float> | ASTRA-Sim topology link latency in ns. A scalar is broadcast to all topology dimensions; an array must match the final `npus_count` rank |
+| `network_topology` | String or Array<String> | ASTRA-Sim analytical topology. Supported values: `Ring`, `Switch`, `FullyConnected`. A scalar is broadcast to all topology dimensions; an array must match the final `npus_count` rank. Defaults to `FullyConnected` for backward compatibility |
 
 ### Per-node fields
 
@@ -80,6 +81,9 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 | `prioritize_prefill` | Boolean | No | Per-instance override for `--prioritize-prefill` |
 | `enable_local_offloading` | Boolean | No | Per-instance override for `--enable-local-offloading` |
 | `enable_attn_offloading` | Boolean | No | Per-instance override for `--enable-attn-offloading` |
+| `enable_expert_offloading` | Boolean | No | Per-instance override for `--enable-expert-offloading` |
+| `expert_offload` | Object | No | Runtime options for expert PIM offload support, including custom routing distribution paths |
+| `expert_routing_distribution_csv` | String | No | Optional shorthand for `expert_offload.routing_distribution_csv`; path to a custom expert-routing distribution CSV |
 | `enable_sub_batch_interleaving` | Boolean | No | Per-instance override for `--enable-sub-batch-interleaving` |
 | `enable_block_copy` | Boolean | No | Per-instance override for `--enable-block-copy` |
 
@@ -87,7 +91,7 @@ Pass a config file to `python -m serving` via `--cluster-config configs/cluster/
 
 ### Per-instance runtime overrides
 
-The 13 runtime fields listed above (`max_num_seqs`, `max_num_batched_tokens`, etc.) support **per-instance overrides** in the cluster config. This enables heterogeneous deployments where different instances in the same cluster use different scheduler limits.
+The runtime fields listed above (`max_num_seqs`, `max_num_batched_tokens`, etc.) support **per-instance overrides** in the cluster config. This enables heterogeneous deployments where different instances in the same cluster use different scheduler limits.
 
 **Precedence rule:**
 ```
@@ -103,6 +107,7 @@ Setting a numeric field to `0` means "unlimited" (via the `_runtime_limit` helpe
 
 **Validation gates:**
 - `enable_sub_batch_interleaving: true` requires `enable_attn_offloading: true` (enforced at config load time)
+- `expert_routing_distribution_csv` is passed to trace generation when `--expert-routing-policy CUSTOM` is selected.
 
 **Example: heterogeneous P/D instances**
 
@@ -127,12 +132,56 @@ See `single_node_pd_per_instance_config.json` for a concrete example where the p
 }
 ```
 
+### Expert-offload runtime fields
+
+These fields configure expert-offload plumbing. `routing_distribution_csv` is active for CSV-backed custom expert routing when `--expert-routing-policy CUSTOM` is selected; later phases use the remaining manifest/profile fields for PIM expert trace generation. `cold_experts_csv` uses a count-based schema: `experts_in_pim` is the number of lowest-probability experts to place in PIM for a layer, not an explicit expert id. Layer-specific count rows override the wildcard count row.
+
+Example decode-instance shape:
+
+```json
+{
+  "pd_type": "decode",
+  "enable_expert_offloading": true,
+  "expert_offload": {
+    "apply_to": ["decode"],
+    "cold_experts_csv": "configs/expert_offload/qwen3_235b_fp8_cold_experts.csv",
+    "routing_distribution_csv": "configs/expert_offload/qwen3_235b_fp8_expert_distribution.csv",
+    "pim_expert_profile_csv": "profiler/perf/H200/Qwen/Qwen3-235B-A22B-FP8/fp8-kvfp8/tp1/LPDDR5_2GB_6400/pim_moe.csv",
+    "channel_policy": "greedy_load",
+    "pim_profile_time_semantics": "end_to_end_excludes_transfer",
+    "activation_transfer": {
+      "npu_to_pim_bw_GBps": 64,
+      "pim_to_npu_bw_GBps": 64,
+      "npu_to_pim_latency_ns": 1000,
+      "pim_to_npu_latency_ns": 1000
+    }
+  }
+}
+```
+
+For active expert offload, `pim_moe.csv` is interpreted as CPU/PIM-visible expert runtime only: routed hidden vectors are already visible to the CPU/PIM side at profile entry and output hidden vectors are CPU/PIM-visible at profile exit. The simulator therefore always requires `expert_offload.activation_transfer` and emits explicit local NPU<->CPU/PIM activation-transfer rows outside `PIM ... PIM END`. Transfer bytes are aggregated per MoE layer from cold expert-token pairs: input bytes = `sum(tokens_for_cold_expert * hidden_size * dtype_bytes)`, and output bytes use the same formula. Transfer latency is `fixed_latency_ns + ceil(bytes / bandwidth_GBps)` for each direction, using decimal GB/s (equivalent to bytes/ns). Expert-PIM rows inside `PIM ... PIM END` carry the `pim_moe.csv` runtime but intentionally emit zero input/output tensor sizes for the ASTRA PIM backend, because that backend adds memory service time from `tensor_size`; this prevents double-counting activation movement already represented by the explicit transfer rows. Existing EP dispatch/combine collectives remain in place for hot NPU expert exchange.
+
 ### Parallelism rules:
 - `num_npus = tp_size * pp_size`
 - TP and EP share the same GPUs: non-MoE layers use TP (ALLREDUCE), MoE layers use EP (ALLTOALL)
 - DP is achieved via multiple instances with the same `dp_group`
 - Without `dp_group`: `ep_size <= tp_size`
 - For MoE models: `ep_size` must divide `num_local_experts`
+
+### Network topology:
+By default, `config_builder.py` emits `FullyConnected` for every ASTRA-Sim topology dimension to preserve legacy behavior. Set `network_topology` at the top level to select any ASTRA-Sim analytical topology supported by the backend: `Ring`, `Switch`, or `FullyConnected`.
+
+For a single-dimensional TP=4 instance, use a scalar:
+
+```json
+{
+  "network_topology": "Switch",
+  "link_bw": 128,
+  "link_latency": 500
+}
+```
+
+For multi-dimensional layouts, use either a scalar to broadcast the same topology to all dimensions or an array matching the generated topology rank, for example `"network_topology": ["Switch", "Ring"]`.
 
 ### DP+EP topology:
 When `dp_group` is set, `config_builder.py` generates a 2D ASTRA-Sim topology

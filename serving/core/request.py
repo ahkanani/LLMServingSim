@@ -43,7 +43,7 @@ class Request:
 
     # to print the request information
     def __str__(self):
-        return str(self.__dict__) 
+        return str(self.__dict__)
 
     def add_latency(self, end_time):
         self.end_time = end_time
@@ -53,21 +53,21 @@ class Request:
             self.tpot = 0
         else:
             self.tpot = (self.latency - self.ttft) // (self.output - self.input - 1)
-    
-    def add_itl(self, current): # 
+
+    def add_itl(self, current): #
         self.itl.append(current - self.recent_end)
         self.recent_end = current
 
     def set_que_delay(self, current):
         self.queuing_delay = current - self.arrival
-    
+
     def set_ttft(self, current):
         self.ttft = current - self.arrival
         self.recent_end = current
-    
+
     def log(self):
         print("         scheduled request : {}".format(self.__dict__))
-    
+
     def is_prefill(self):
         """Check if request is still in prefill phase (has tokens left to compute)"""
         return self.num_computed_tokens < self.original_input
@@ -107,4 +107,3 @@ class Batch:
         for req in self.requests:
             req.log()
         print("----------------------------------------------------------")
-    

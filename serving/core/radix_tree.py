@@ -95,7 +95,7 @@ class TreeNode:
     @property
     def evicted(self):
         return self.value is None
-    
+
     def get_last_hash_value(self) -> Optional[str]:
         """Returns the hash value of the last page in this node."""
         if self.hash_value is None or len(self.hash_value) == 0:
@@ -123,7 +123,7 @@ def _key_match_paged(key0: List, key1: List, page_size: int):
         if key0[i : i + page_size] != key1[i : i + page_size]:
             break
         i += page_size
-    
+
     rem = min_len - i
     if rem and (len(key0) == len(key1)) and (key0[i:i+rem] == key1[i:i+rem]):
         i += rem
@@ -159,7 +159,7 @@ class RadixCache():
             self.key_match_fn = partial(_key_match_paged, page_size=page_size)
             self.get_child_key_fn = lambda key: tuple(key[:page_size])
         self.reset()
-        
+
         self.capacity = capacity
         self.kv_size = kv_size
         self.kv_stored = 0 # Size of inference kv caches from xPU
@@ -172,9 +172,9 @@ class RadixCache():
 
     ##### CPU Memory Size related API #####
     def total_memory_usage(self):
-        # Add (Size of inference KV cache) + (Size of Prefix Cache(Radix Tree)) 
+        # Add (Size of inference KV cache) + (Size of Prefix Cache(Radix Tree))
         return self.kv_stored + (self.total_size() * self.kv_size)
-    
+
     def allocate(self, size):
         total_usage = self.total_memory_usage()
         if total_usage + size > self.capacity:
@@ -190,8 +190,8 @@ class RadixCache():
             size / MB_TO_BYTE,
             self.total_memory_usage() / MB_TO_BYTE,
         )
-        
-    
+
+
     def free(self, size):
         total_usage = self.total_memory_usage()
         if total_usage - size < 0:
@@ -207,13 +207,13 @@ class RadixCache():
             size / MB_TO_BYTE,
             self.total_memory_usage() / MB_TO_BYTE,
         )
-    
+
     def is_avail(self, size):
         if self.capacity - self.total_memory_usage() >= size:
             return True
         else:
             return False
-    
+
     def need_size(self, size):
         needed = (size - (self.capacity - self.total_memory_usage()))
         if needed > 0:
@@ -223,7 +223,7 @@ class RadixCache():
 
     def avail_size(self):
         return max(self.capacity - self.total_memory_usage(), 0)
-        
+
     ##### Public API #####
 
     def reset(self):
@@ -253,7 +253,7 @@ class RadixCache():
                 )
 
             hit_length, last_node = self._match_prefix_helper(self.root_node, key)
-            
+
             if self.page_size != 1:
                 # example : hit_length = 7, self.page_size = 4
                 # => hit_length = 4 (cut by page_size)
@@ -291,12 +291,12 @@ class RadixCache():
             computed_len = req.num_computed_tokens
             token_ids = (req.input_hash_ids + req.output_hash_ids)[:computed_len]
             # print("[radix_tree: cache_unfinished_req()] req_id: {}, computed_len: {}".format(req.id, computed_len))
-            
+
             if self.page_size != 1 and not self.save_unfull_chunk:
                 page_aligned_len = len(token_ids) // self.page_size * self.page_size
             else:
                 page_aligned_len = len(token_ids)
-                    
+
             insert_token_ids = token_ids[:page_aligned_len]
 
             # Radix Cache takes one ref in memory pool
@@ -345,7 +345,7 @@ class RadixCache():
         return self.total_requested_tokens, self.total_hit_tokens
 
     def pretty_print(self):
-        self._print_helper(self.root_node, 0)
+        # self._print_helper(self.root_node, 0)
         print(f"#tokens: {self.total_size()}")
 
     def dump_lock_refs(self):
@@ -437,7 +437,7 @@ class RadixCache():
 
     def _match_prefix_helper(self, node: TreeNode, key: List) -> tuple[int, TreeNode]:
         node.last_access_time = time.monotonic()
-        
+
         if len(key) == 0:
             return 0, node
 
@@ -474,9 +474,9 @@ class RadixCache():
 
         child.parent = new_node
         child.key = child.key[split_len:]
-        
+
         new_node.parent.children[self.get_child_key_fn(key)] = new_node
-        
+
         new_node.hash_value, child.hash_value = self.split_node_hash_value(
             child.hash_value, split_len, self.page_size)
         # print(f"[RADIX_SPLIT] -> new_node_id={new_node.id} key_len={len(new_node.key)}, child_id={child.id} key_len={len(child.key)}")
@@ -498,7 +498,7 @@ class RadixCache():
         new_node_hash = child_hash_value[:split_pages]
         child_hash = child_hash_value[split_pages:]
         return new_node_hash, child_hash
-    
+
     def _insert_helper(self, node: TreeNode, key: List):
         # node : self.root_node, key: token_ids (to insert)
         node.last_access_time = time.monotonic()
@@ -532,7 +532,7 @@ class RadixCache():
             # print(f"[RADIX_INSERT] new_leaf node_id={new_node.id} key_len={len(key)} parent_id={node.id}")
             self._record_store_event(new_node)
         return total_prefix_length
-    
+
     def _print_helper(self, node: TreeNode, indent: int):
         """Prints the radix tree in a human-readable format."""
         stack = [(node, indent)]
@@ -547,9 +547,9 @@ class RadixCache():
                 if getattr(child, "key", None):
                     toks.extend(child.key)
                 cur = child
-        
+
             return cur, toks
-        
+
         def fmt_tokens(toks):
             return "[" + ", ".join(str(t) for t in toks) + "]"
 
@@ -620,7 +620,7 @@ class RadixCache():
                 # Chain next chunk to this one.
                 parent_block_hash = block_hash
             # print(f"[RADIX_STORE] node_id={node.id} key_len={len(node.key)} pages={num_pages}")
-            
+
 
     def _record_remove_event(self, node: TreeNode):
         # One BlockRemoved per chunk.

@@ -528,3 +528,12 @@ HOST_ENGINE_DEFAULTS: dict[str, Any] = {
     # one captures the per-block cost and keeps profiling cheap.
     "hf_overrides": {"num_hidden_layers": 1},
 }
+
+# Model-specific overrides needed when the representative one-layer
+# profile would otherwise miss a module that appears later in the real
+# network. Example: DeepSeek-V2-Lite has layer 0 as dense MLP and MoE
+# starts at layer 1 (first_k_dense_replace=1); for the one-layer test
+# model we force layer 0 to be MoE so moe.csv can be collected.
+MODEL_TYPE_ENGINE_OVERRIDES: dict[str, dict[str, Any]] = {
+    "deepseek_v2": {"hf_overrides": {"first_k_dense_replace": 0}},
+}

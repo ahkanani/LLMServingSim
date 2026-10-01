@@ -1,0 +1,34 @@
+trace:
+  trace_pack_path: tracepacks/full/qwen3_235b_a22b_fp8/mmlu
+  benchmark: mmlu
+model:
+  config_path: ../../../models/qwen3_235b_a22b_fp8.yaml
+hardware:
+  config_path: ../../../hardware/8gpu_h200_remote_mem_bw045.yaml
+replay:
+  seed: 123
+  max_batch_size: 128
+  warmup_steps: 16
+  eval_steps: 5000
+run:
+  seed: 123
+  output_dir: runs/remote_mem/sensitivity
+  run_id: remote_mem_qwen3_mmlu_h75_c25_bw045_b128
+  overwrite: false
+predictor:
+  type: heuristic
+  horizon: 1
+  window_size: 128
+  decay: 0.95
+  use_prefill_context: false
+placement:
+  mode: static_hot_cold
+  hot_fraction: 0.75
+  cold_fraction: 0.25
+  warmup_weight: 1.0
+  prediction_weight: 1.0
+scheduler:
+  policy: placement_greedy
+  oracle_comparison: true
+metrics:
+  level: summary

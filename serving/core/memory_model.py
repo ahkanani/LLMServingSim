@@ -58,7 +58,7 @@ class MemoryModel():
         if enable_prefix_caching:
             one_token_kv_size = self.get_kv(1)
             self.mem_for_kv = self.npu_mem - self.weight
-            self.npu_prefix_cache = RadixCache(device='NPU', 
+            self.npu_prefix_cache = RadixCache(device='NPU',
                                                node_id=self.node_id,
                                                instance_id=self.instance_id,
                                                page_size=self.block_size,
@@ -80,7 +80,7 @@ class MemoryModel():
                     else:
                         raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}]: Device {prefix_storage} is currently not supported as a second tier prefix cache storage")
                     # print("[instance {}] prefix_cache_capacity : {}".format(instance_id, prefix_cache_capacity // GB_TO_BYTE))
-                    self.second_tier_prefix_cache = RadixCache(device=device, 
+                    self.second_tier_prefix_cache = RadixCache(device=device,
                                                     node_id=self.node_id,
                                                     instance_id=self.instance_id,
                                                     page_size=1,
@@ -88,7 +88,7 @@ class MemoryModel():
                                                     kv_size=(one_token_kv_size * self.num_npus),
                                                     enable_kv_cache_events=True,
                                                     )
-                
+
         # Hash id -> token length for corresponding prefix cache block
         self._npu_cache_hashtolen = {}
         self._cpu_cache_hashtolen = {}
@@ -150,7 +150,7 @@ class MemoryModel():
 
         # K & V multiply 2
         return 2 * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
-    
+
     # get the total size of current kv cache for the request
     # used when adding prefilled request to decode instance.
     def get_total_kv(self, req):
@@ -161,7 +161,7 @@ class MemoryModel():
     # get size of kv block that should be 'added'. including new init requests
     # also checks evicted request and include its kv cache
     # scheduled_tokens: dict mapping request id to number of tokens scheduled this step
-    # 
+    #
     # vLLM-style cumulative allocation:
     #   blocks_after = ceil((computed + scheduled) / block_size)
     #   blocks_before = ceil(computed / block_size) if computed > 0 else 0
@@ -176,22 +176,22 @@ class MemoryModel():
                 # computed blocks. Existing evicted KV is reloaded separately
                 # by Scheduler.load_size.
                 hit = req.npu_cache_hit if self.enable_prefix_caching else 0
-                
+
                 if scheduled_tokens and req.id in scheduled_tokens:
                     tokens_this_step = scheduled_tokens[req.id]
                 else:
                     raise RuntimeError("[MemoryModel] [node_id={self.node_id},inst={self.instance_id}]: scheduled_tokens cannot be None")
-                
+
                 # vLLM-style cumulative block allocation
                 computed_before = req.num_computed_tokens
-                
+
                 total_after = computed_before + tokens_this_step
-                
+
                 # Calculate blocks needed (cumulative)
                 blocks_after = (total_after + self.block_size - 1) // self.block_size
                 blocks_before = (computed_before + self.block_size - 1) // self.block_size if computed_before > 0 else 0
-                
-                
+
+
                 new_blocks = max(0, blocks_after - blocks_before)
                 block_kv_size += self.get_kv(new_blocks * self.block_size)
                 # print("[DEBUG] hit : {} | tokens_this_step : {} | computed_before : {} | total_after : {} | new_blocks : {} | block_kv_size : {}".format(
@@ -205,7 +205,7 @@ class MemoryModel():
                 if num_after > num_before: # difference of the block is maximum one block
                     block_kv_size += self.get_kv(self.block_size)
         return block_kv_size
-    
+
     # get size of kv cache that should be evicted
     def get_evict_kv(self, req):
         evict_size = 0
@@ -245,7 +245,7 @@ class MemoryModel():
         return
 
     # -------------------- Memory Management --------------------
-    
+
     def allocate(self, size, device):
         if device == Device.NPU:
             if self.npu_used + size > self.npu_mem:
@@ -279,7 +279,7 @@ class MemoryModel():
             self.second_tier_prefix_cache.allocate(size)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to allocate KV cache in unsupported device {device}")
-    
+
     def free(self, size, device):
         if device == Device.NPU:
             if self.npu_used - size < self.weight:
@@ -314,13 +314,13 @@ class MemoryModel():
             self.second_tier_prefix_cache.free(size)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to free KV cache in unsupported device {device}")
-    
+
     def is_avail(self, size, device):
         if device == Device.NPU:
             if self.npu_mem - self.npu_used >= size:
                 return True
             else:
-                return False 
+                return False
         elif device == Device.CPU:
             if self.enable_prefix_sharing:
                 return self.second_tier_prefix_cache.is_avail(size)
@@ -328,12 +328,12 @@ class MemoryModel():
                 if self.cpu_mem - self.cpu_used >= size:
                     return True
                 else:
-                    return False 
+                    return False
         elif device == Device.CXL:
             return self.second_tier_prefix_cache.is_avail(size)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to check available size of unsupported device {device}")
-    
+
     def need_size(self, size, device):
         if device == Device.NPU:
             needed = (size - (self.npu_mem - self.npu_used))
@@ -358,14 +358,14 @@ class MemoryModel():
     def avail_size(self, device):
         if not self.enable_prefix_caching:
             return 0
-        
+
         if device == Device.NPU:
             return self.npu_prefix_cache.avail_size()
         elif device == Device.CPU or device == Device.CXL:
             return self.second_tier_prefix_cache.avail_size()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to get available size of prefix cache in unsupported device {device}")
-    
+
     # -------------------- Prefix Cache Management --------------------
 
     def storage_cache_evicted_req(self, req):
@@ -379,7 +379,7 @@ class MemoryModel():
     def evictable_size(self, device):
         if not self.enable_prefix_caching:
             return 0
-        
+
         if device == Device.NPU:
             return self.npu_prefix_cache.evictable_size() * self._bytes_per_token
         elif device == Device.CPU or device == Device.CXL:
@@ -388,11 +388,11 @@ class MemoryModel():
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to get evictable size of prefix cache in unsupported device {device}")
 
 
-    def lock_prefix(self, req, device): 
+    def lock_prefix(self, req, device):
         # Increment lock ref count on req.npu_last_node (set by prefix_match)
         if not self.enable_prefix_caching:
             return
-        
+
         if device == Device.NPU and req.npu_last_node is not None:
             node = req.npu_last_node
             # print(f"[LOCK] req={req.id} lock_prefix node_id={node.id} lock_ref_BEFORE={node.lock_ref}")
@@ -402,12 +402,12 @@ class MemoryModel():
             self.second_tier_prefix_cache.inc_lock_ref(req.cpu_last_node)
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to lock prefix cache in unsupported device {device}")
-    
+
     def unlock_prefix(self, req, device):
         # Decrement lock ref count on req.npu_last_node (set by prefix_match)
         if not self.enable_prefix_caching:
             return
-        
+
         if device == Device.NPU and req.npu_last_node is not None:
             node = req.npu_last_node
             # print(f"[UNLOCK] req={req.id} unlock_prefix node_id={node.id} lock_ref_BEFORE={node.lock_ref}")
@@ -420,16 +420,16 @@ class MemoryModel():
             req.cpu_last_node = None
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to unlock prefix cache in unsupported device {device}")
-    
+
     def cache_unfinished_req(self, req, device):
         # Get new_last_node via cache_unfinished_req (replaces last node)
         # Decrement old node's lock ref count, increment new node's lock ref count
         if not self.enable_prefix_caching:
             return
-        
+
         if device == Device.NPU:
             new_last_node = self.npu_prefix_cache.cache_unfinished_req(req)
-            
+
             old_node = req.npu_last_node
             # print(f"[CACHE_UNFINISHED] req={req.id} old_node_id={old_node.id if old_node else None}(lock_ref={old_node.lock_ref if old_node else 'N/A'}) -> new_node_id={new_last_node.id}(lock_ref={new_last_node.lock_ref})")
             if old_node is not None and req._prefix_locked:
@@ -450,13 +450,13 @@ class MemoryModel():
                 self.second_tier_prefix_cache.pretty_print()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to cache prefix cache of unfinished request to unsupported device {device}")
-        
+
         self.apply_kv_cache_events()
 
     def cache_finished_req(self, req, device):
         if not self.enable_prefix_caching:
             return
-        
+
         if device == Device.NPU:
             self.npu_prefix_cache.cache_finished_req(req)
             # Only dec_lock_ref if the request was locked
@@ -488,7 +488,7 @@ class MemoryModel():
                 self.second_tier_prefix_cache.pretty_print()
         else:
             raise RuntimeError(f"[MemoryModel] [node_id={self.node_id},inst={self.instance_id}] Trying to cache prefix cache of finished request to unsupported device {device}")
-        
+
         self.apply_kv_cache_events()
 
     def evict_prefix_cache(self, bytes, device):
@@ -511,10 +511,10 @@ class MemoryModel():
 
     # -------------------- Prefix Cache Helpers --------------------
 
-    def prefix_match(self, req): # req.prefix_cache_hit initialization 
+    def prefix_match(self, req): # req.prefix_cache_hit initialization
         if not self.enable_prefix_caching:
             return
-        
+
         tokens = req.input_hash_ids
         if tokens is None:
             return
@@ -531,7 +531,7 @@ class MemoryModel():
         else:
             req.storage_cache_hit = 0
             req.storage_last_node = None
-        
+
         req.prefix_cache_hit = max(req.npu_cache_hit, req.storage_cache_hit)
         # if req.num_computed_tokens < req.prefix_cache_hit:
         #     req.num_computed_tokens = req.prefix_cache_hit
@@ -539,16 +539,16 @@ class MemoryModel():
             req.num_computed_tokens = req.prefix_cache_hit
             # print(f"Request[{req.id}] prefix cache hit: {req.prefix_cache_hit} tokens (NPU: {req.npu_cache_hit}, {self.prefix_storage}: {req.storage_cache_hit})")
         # for debugging
-        
+
         # print(f"===============NPU PREFIX CAHCE of Instance[{self.instance_id}]=================")
         # self.npu_prefix_cache.pretty_print()
         # print("===============CPU PREFIX CAHCE=================")
         # self.second_tier_prefix_cache.pretty_print()
-    
+
     def erase_prefix_info(self, req):
         if not self.enable_prefix_caching:
             return
-        
+
         req.prefix_cache_hit = 0
         req.npu_cache_hit = 0
         req.storage_cache_hit = 0
@@ -562,7 +562,7 @@ class MemoryModel():
         self.free(self.npu_prefix_cache.evictable_size() * self._bytes_per_token, Device.NPU)
         if not self.enable_prefix_sharing and self.prefix_storage is not None:
             self.free(self.second_tier_prefix_cache.evictable_size() * self._bytes_per_token * self.num_npus, self.prefix_storage)
-    
+
     # Count load/unload events from prefix cache and update memory usage
     def apply_kv_cache_events(self):
         # if not self.enable_prefix_caching:
@@ -654,7 +654,7 @@ class MemoryModel():
             return (self.npu_prefix_cache.return_prefix_info(), (0, 0))
         return (self.npu_prefix_cache.return_prefix_info(), self.second_tier_prefix_cache.return_prefix_info())
 
-        
+
 def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     """Bytes of KV cache per token aggregated over the full TP cluster.
 
@@ -673,6 +673,54 @@ def full_cluster_kv_bytes_per_token(model, fp, kv_cache_dtype='auto'):
     kv_fp = 1 if kv_cache_dtype == 'fp8' else fp // 8
     # 2 (K + V) * kv_dim * n_layer * bytes_per_elem
     return 2 * kv_dim * n_layer * kv_fp
+
+
+def _get_num_moe_experts(config):
+    """Return the number of routed MoE experts in a model config.
+
+    HF configs use different field names by model family. Prefer the
+    canonical fields already consumed elsewhere in the simulator, then fall
+    back to DeepSeek's native ``n_routed_experts`` if a future raw config omits
+    the compatibility ``num_experts`` alias.
+    """
+    return config.get(
+        "num_local_experts",
+        config.get("num_experts", config.get("n_routed_experts")),
+    )
+
+
+def calculate_expert_sizes(model, tokens, fp=2):
+    """Bytes touched by executing one routed MoE expert.
+
+    Returns ``(input_size, weight_size, output_size)`` for a single expert's
+    MLP, using the same byte-oriented ``fp`` convention as ``calculate_sizes``.
+    Router/gate weights are intentionally excluded: routing stays on the NPU,
+    while this helper models only the resident expert body used by cold-expert
+    PIM compute.
+    """
+    config = get_config(model)
+    n_embd = config["hidden_size"]
+    moe_ffn_dim = config.get(
+        "moe_intermediate_size",
+        config.get("intermediate_size", config.get("ffn_dim")),
+    )
+    num_experts = _get_num_moe_experts(config)
+    if num_experts is None:
+        raise ValueError(f"Model {model} is not a routed MoE config: missing num_local_experts/num_experts")
+    if moe_ffn_dim is None:
+        raise ValueError(f"Model {model} is missing moe_intermediate_size/intermediate_size")
+
+    tokens = int(tokens)
+    fp = int(fp)
+    if tokens < 0:
+        raise ValueError(f"tokens must be non-negative, got {tokens}")
+    if fp <= 0:
+        raise ValueError(f"fp must be positive bytes per element, got {fp}")
+
+    input_size = tokens * n_embd * fp
+    weight_size = 3 * n_embd * int(moe_ffn_dim) * fp
+    output_size = tokens * n_embd * fp
+    return input_size, weight_size, output_size
 
 
 # calculate the per-rank input, weight, output size of each layer
@@ -784,6 +832,10 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         weight_size = (n_embd * num_local_experts * fp  # gate (replicated)
                      + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp)  # local experts
         output_size = length * n_embd * fp
+
+    elif layer_name == "moe_expert":
+        input_size, weight_size, output_size = calculate_expert_sizes(
+            model, length, fp=fp)
 
     # ----------------- LM Head -----------------
     elif layer_name == "lm_head":

@@ -1,0 +1,34 @@
+# Project-local generated/working directories not tracked in git.
+runs/*
+
+scripts/
+!scripts/
+!scripts/plot_remote_mem_sum_report_figures.py
+scripts/*
+!scripts/plot_remote_mem_sum_static_sweep.py
+!scripts/run_remote_mem_adaptive_sweep.py
+!scripts/run_remote_mem_sum_static_sweep.py
+tests/
+
+# Python/cache/build artifacts.
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
+
+# Virtual environments.
+.trae/
+.venv/
+venv/
+env/
+
+# Large local TracePack artifacts if any are created under the repo.
+*.parquet
+*.arrow

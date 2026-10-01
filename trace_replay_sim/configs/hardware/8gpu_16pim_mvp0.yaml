@@ -1,0 +1,10 @@
+hardware:
+  hardware_id: 8gpu_16pim_mvp0
+  description: "MVP-0 default from the candidate-score report: 8 GPUs + 16 PIM pkgs."
+  gpu_count: 8
+  gpu_bw_tbps_each: 4.0
+  pim_count: 16
+  pim_bw_tbps_each: 0.6
+  # G in the report equations. MVP-0 default is GEMV-only PIM, one token per
+  # expert weight read; future ablations can set 4 for slim-GEMM-style PIM.
+  pim_granularity: 1
