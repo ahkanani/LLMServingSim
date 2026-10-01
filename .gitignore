@@ -24,6 +24,7 @@ outputs/*
 astra-sim/inputs/runs/
 
 # AI agent cache files
+.vscode/
 .claude/
 .codex/
 .cursor/
@@ -34,3 +35,5 @@ outputs/*/
 outputs/**/__pycache__/
 outputs/**/*.pyc
 bench/outputs/
+
+RECONSTRUCTION.md

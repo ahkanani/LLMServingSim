@@ -72,7 +72,7 @@ Some model configs (e.g., Llama 3.x, gated Qwen variants) live behind
 HF authentication. The profiler can auto-fetch these if you set:
 
 ```bash
-export HF_TOKEN="<hugging-face-token>"
+export HF_TOKEN="hf_xxxxxxxxxxxxxxxxxxxxxxxxxx"
 ```
 
 Running pre-profiled simulations never needs a token. You do need one

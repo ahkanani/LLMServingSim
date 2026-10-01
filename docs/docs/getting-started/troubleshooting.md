@@ -88,7 +88,7 @@ meta-llama/Llama-3.1-8B is restricted...
    container:
 
    ```bash
-   export HF_TOKEN="<hugging-face-token>"
+   export HF_TOKEN="hf_xxxxxxxxxxxxxxxxxxxxxxxxxx"
    ./scripts/docker-vllm.sh
    ```
 
