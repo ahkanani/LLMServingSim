@@ -1,15 +1,3 @@
-[submodule "astra-sim/extern/helper/fmt"]
-	path = astra-sim/extern/helper/fmt
-	url = https://github.com/fmtlib/fmt.git
-[submodule "astra-sim/extern/helper/spdlog"]
-	path = astra-sim/extern/helper/spdlog
-	url = https://github.com/gabime/spdlog.git
-[submodule "astra-sim/extern/network_backend/ns-3"]
-	path = astra-sim/extern/network_backend/ns-3
-	url = https://github.com/casys-kaist/astra-network-ns3.git
-[submodule "astra-sim/extern/network_backend/csg-htsim"]
-	path = astra-sim/extern/network_backend/csg-htsim
-	url = https://github.com/Broadcom/csg-htsim.git
-[submodule "astra-sim/extern/network_backend/analytical"]
-	path = astra-sim/extern/network_backend/analytical
-	url = https://github.com/casys-kaist/astra-network-analytical.git
+[submodule "astra-sim"]
+	path = astra-sim
+	url = https://github.com/casys-kaist/astra-sim.git

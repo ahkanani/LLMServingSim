@@ -8,8 +8,8 @@ sidebar_position: 1
 Processing-in-memory (PIM) puts compute units physically inside DRAM,
 turning a traditionally memory-bandwidth-bound kernel into a
 compute-on-data-path operation. LLMServingSim models PIM as a
-separate device that can take over **attention** specifically, the
-rest of the layer still runs on the GPU.
+separate device that can take over **attention** or selected **MoE experts**.
+Each path is configured independently.
 
 This page describes how the PIM path lives inside the simulator. The
 *configuration* angle (what flag to pass, how to wire up a PIM
@@ -121,9 +121,13 @@ When PIM offload is on, KV blocks live in PIM memory (per-channel)
 rather than NPU memory. The memory model accounts for this:
 
 - `npu_used` drops by the KV-cache footprint.
-- `pim_used` rises by the same amount.
-- KV evictions go from PIM → CPU (or wherever `kv_evict_loc` is
-  pointing) instead of NPU → CPU.
+- There is **no `pim_used` counter.** `MemoryModel` exposes exactly two
+  ledgers, `npu_used` and `cpu_used`, and PIM-resident KV lands in the
+  latter, since PIM sits in the host memory the node's `cpu_mem`
+  describes. The heartbeat's `Node[i]: Total CPU Memory Usage` line is
+  where it shows up.
+- KV evictions go from PIM → wherever `kv_evict_loc` points, instead of
+  NPU → CPU.
 
 This is what makes PIM offload memory-attractive for long-context
 workloads: the GPU's HBM is freed up to hold larger weights or more
@@ -144,20 +148,25 @@ The standard fix is **sub-batch interleaving**: overlap GPU compute
 on one half of the batch with PIM attention on the other half. See
 [Examples → Sub-batch interleaving](/docs/examples/advanced/sub-batch-interleaving).
 
-## Throughput log additions
+## What PIM offload does *not* add to the log
 
-When PIM is active, the throughput log gains a `pim_busy=` field per
-node:
+Nothing. The heartbeat block is identical with and without
+`--enable-attn-offloading` — there is no PIM utilization or busy-fraction
+counter anywhere in the simulator.
 
-```
-[INFO] step=10 batch=8 prompt_t=1.1k tok/s decode_t=520 tok/s
-       npu_mem=63.4 GB pim_busy=72%
-```
+Offloading works by substituting PIM attention for the NPU attention
+kernel inside the generated trace, so its effect is visible as changed
+generation throughput and TPOT rather than as a new field. To attribute
+a slowdown to PIM:
 
-`pim_busy` is the fraction of simulated time the PIM device was
-running attention work in the last log interval. When this saturates
-near 100%, PIM is your bottleneck, try multi-channel PIM, or revert
-to NPU attention for prefill-heavy phases.
+- Run the same workload with and without `--enable-attn-offloading` and
+  compare TPOT.
+- Pass `--save-trace-text` and read the emitted trace: PIM work sits
+  between `PIM <channel>` and `PIM END` markers, with its own
+  `comp_time`.
+- Widen the node's `cpu_mem.mem_size` to buy more PIM channels — channel
+  count is derived from it, not declared. See
+  **[PIM config](/docs/reference/pim-config#how-the-numbers-are-derived)**.
 
 ## Gotchas
 
@@ -185,3 +194,37 @@ to NPU attention for prefill-heavy phases.
   the configuration walkthrough.
 - **[Power model](./power-model)**: PIM has its own idle / active
   power parameters in the node `power` block.
+
+## Cold MoE expert offload
+
+Enable `--enable-expert-offloading`, or set `enable_expert_offloading: true`
+on a decode instance, and configure `cpu_mem.pim_config`. The instance's
+`expert_offload` object supplies:
+
+- `cold_experts_csv`: per-layer counts of lowest-probability experts to place in PIM.
+- `routing_distribution_csv`: custom expert probabilities, used with
+  `--expert-routing-policy CUSTOM`. Layer-specific probabilities disable block replay.
+- `pim_expert_profile_csv`: PIM expert runtime in microseconds.
+- `pim_profile_time_semantics: "end_to_end_excludes_transfer"`: the profile
+  excludes NPU-to-PIM and PIM-to-NPU activation transfers.
+- `activation_transfer`: bandwidth in decimal GB/s and fixed latency in
+  nanoseconds for each direction.
+- `apply_to: ["decode"]` and `channel_policy: "greedy_load"`.
+
+Hot NPU expert work overlaps the cold path: input transfer, PIM expert
+compute, and output transfer. A join waits for both paths before the
+combine collective or next layer. Expert PIM compute uses zero activation
+tensor sizes because transfers are charged by the explicit transfer rows.
+Prefill instances keep expert execution on the NPU.
+
+The bundled example uses a synthetic PIM profile for exercising the path:
+
+```bash
+python -m serving \
+  --cluster-config configs/cluster/pim_experiments/expert_pim/01_offload8_equal.json \
+  --dataset workloads/example_trace.jsonl --num-reqs 10 \
+  --expert-routing-policy CUSTOM --save-trace-text
+```
+
+`00_gpu_equal.json` in the same directory provides the NPU comparison.
+Supply measured PIM profiles before using these examples for performance claims.

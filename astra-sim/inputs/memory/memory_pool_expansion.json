@@ -1,8 +1,0 @@
-{
-    "remote_mem":
-        {
-              "memory-type": "MEMORY_POOL",
-              "remote-mem-latency": 0,
-              "remote-mem-bw": 512
-        }
-}
