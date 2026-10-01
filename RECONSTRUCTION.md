@@ -33,9 +33,11 @@ were whitespace-only, so those files use main's implementations.
 
 Retained and adapted expert offloading, detailed/custom routing, configurable
 network topology, DeepSeek profiling overrides, H200 profile bundles, model
-configs, experiment configs, and the trace-replay project. Expert trace emitters
-now supply field tuples to main's in-process converter. The trace-replay tree
-and internship H200 bundles are identical to the original release.
+configs, and experiment configs. The trace-replay project was subsequently
+extracted into an independent repository (see below). Expert trace emitters
+now supply field tuples to main's in-process converter. The extracted
+trace-replay source tree and internship H200 bundles are identical to the
+original release.
 
 Restored main's documentation deployment workflow and recorded example outputs.
 The deleted radix-tree cache stays deleted; the current block pool handles KV
@@ -65,6 +67,43 @@ These submodule commits are **local only**. A remote clone cannot retrieve them
 until the dependent repositories are published. For a later publication, the
 memory and Chakra commits must be available before ASTRA, and ASTRA before the
 parent repository. Publication destinations can be chosen during review.
+
+## PIM integration details
+
+Shared PIM initialization now uses attention offload **or** expert offload,
+so expert-only runs initialize their PIM memory and channels. PIM power
+accounting charges recorded PIM work in either mode. These changes were
+already present in the internship release and were retained during integration.
+
+The attention-PIM emitter is identical to current main, as is `PIMModel`.
+The internship's hot/cold split, channel assignment, decode gating, and
+activation-transfer calculations are preserved. Emitters changed from formatted
+text strings to field tuples because current main feeds Chakra in-process.
+This changes the representation, not the emitted latency/size values.
+
+ASTRA's core C++ remains current main. Its memory backend retains the
+internship change that avoids adding memory service time to zero-byte PIM
+operations. Chakra retains expert hot/cold fork/join dependencies alongside
+main's pipeline-boundary and conversion changes. The attention-only PIM and
+PIM sub-batch regression clocks remained equal to main's recorded baselines.
+
+## Independent trace replay repository
+
+At the user's request, `trace_replay_sim/` is removed from the final
+LLMServingSim tree. It is an independent sibling repository of the original
+checkout at `/disk/ahkanani/lm_sim/trace_replay_sim`, with local branch
+`codex/trace-replay-extracted`. There is no submodule link and no remote.
+Nothing has been pushed.
+
+`git subtree split --prefix=trace_replay_sim bd-opensource-release` produced
+commit `443f8f7`, whose tree is identical to the original release's subtree
+(`5bf021a8b1057c72442ca6c51d2995a35c2168d0`). It preserves the import's
+author, date, and message. A follow-up adds a standalone README, ignore
+rules, and the inherited MIT license; source/config/script files are unchanged.
+The package is installable with `pip install -e .` from its own repository.
+Its CLI, source compilation, and synthetic TracePack/replay check passed after
+extraction. The move changes no serving or backend files, so the recorded
+58-scenario and benchmark results still apply to the same simulator source.
 
 ## Validation
 
@@ -130,8 +169,10 @@ git -C astra-sim/extern/memory_backend/analytical diff 62313ef..codex/bd-release
 
 Verified incremental Git bundles and validation evidence are saved under
 `$(git rev-parse --git-common-dir)/bd-release-review/`, outside this worktree.
-Each bundle includes the corresponding local branch and requires the review
-base in the table above (parent repository: `a4053bc`). Restore into a clone
+Each backend/parent bundle includes the corresponding local branch and requires
+the review base in the table above (parent repository: `a4053bc`). The separate
+`trace-replay-sim.bundle` is self-contained and includes branch
+`codex/trace-replay-extracted`. Restore into a clone
 that contains its base using:
 
 ```bash
