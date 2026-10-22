@@ -366,4 +366,17 @@ if [[ ${#changed[@]} -gt 0 || ${#changed_csv[@]} -gt 0 ]]; then
     echo "(also written to $report)"
 fi
 
+# Replay fixtures are self-contained: external TracePacks are not needed.
+if [[ ${#WANTED[@]} -eq 0 ]]; then
+    echo
+    echo "Checking recorded MoE replay, policy parity, and native backend fixtures..."
+    if LLMSERVINGSIM_REPLAY_INTEGRATION=1 "$PYTHON" -m unittest discover -s tests -v \
+            > "$LOG_DIR/expert_replay.log" 2>&1; then
+        echo "Expert replay: PASS"
+    else
+        echo "Expert replay: FAIL -- see $LOG_DIR/expert_replay.log"
+        fails=$((fails + 1))
+    fi
+fi
+
 exit $((fails > 0))

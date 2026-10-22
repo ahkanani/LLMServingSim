@@ -19,10 +19,17 @@ def main() -> int:
     from workloads.generators.sharegpt import register_args as sg_register
     sg_register(sg)
 
+    moe = sub.add_parser("moe-trace", help="TracePack -> disjoint calibration and serving JSONL")
+    from workloads.generators.moe_trace import register_args as moe_register
+    moe_register(moe)
+
     args = parser.parse_args()
 
     if args.generator == "sharegpt":
         from workloads.generators.sharegpt import run
+        return run(args)
+    if args.generator == "moe-trace":
+        from workloads.generators.moe_trace import run
         return run(args)
 
     parser.error(f"Unknown generator: {args.generator}")

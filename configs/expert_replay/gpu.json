@@ -1,0 +1,27 @@
+{
+  "calibration_file": "workloads/moe_replay/calibration.json",
+  "warmup_steps": 128,
+  "pim_bw_tbps_each": 0.6,
+  "pim_granularity": 1,
+  "predictor": {
+    "type": "heuristic",
+    "horizon": 1,
+    "window_size": 128,
+    "decay": 0.95
+  },
+  "placement": {
+    "mode": "all_gpu",
+    "hot_fraction": 0.5,
+    "cold_fraction": 0.25,
+    "extra_copy_fraction": 0.25
+  },
+  "migration": {
+    "mode": "none",
+    "budget_pairs_per_step": "auto"
+  },
+  "scheduler": {
+    "policy": "gpu_baseline",
+    "latency_combine_mode": "max",
+    "oracle_comparison": true
+  }
+}

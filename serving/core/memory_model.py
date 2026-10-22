@@ -250,6 +250,16 @@ class MemoryModel():
 
     # -------------------- byte-level view over the pools --------------------
 
+    def try_set_resident_weight(self, weight_bytes):
+        """Reserve weights from free memory, retaining every live KV allocation."""
+        weight_bytes = int(weight_bytes)
+        blocks = (int(self.npu_mem * self.npu_memory_utilization) - weight_bytes) // self._npu_bytes_per_block
+        if not self.npu_pool.resize_free_capacity(blocks):
+            return False
+        self._npu_reserved += weight_bytes - self.weight
+        self.weight = weight_bytes
+        return True
+
     @property
     def npu_used(self):
         """Bytes held on the NPU: weights and other reservations, plus KV.

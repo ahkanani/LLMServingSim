@@ -17,8 +17,9 @@ class RequestStatus(Enum):
 
 # class that manages request of astra-sim
 class Request:
-    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True):
+    def __init__(self, id, model, input, output, arrival, instance_id, input_hash_ids=None, output_hash_ids=None, is_init=True, expert_trace_request_id=None):
         self.id = id
+        self.expert_trace_request_id = expert_trace_request_id
         self.model = model
         self.input = input  # Always keep original input length
         self.output = output
@@ -152,6 +153,12 @@ class Batch:
 
         # for debugging
         self.scheduled_tokens = None
+        self.token_spans = ()
+        self.expert_round_plan = None
+        self.expert_ep_offset = 0
+        self.expert_pim_coordinator = False
+        self.expert_controller = None
+        self.expert_replay = False
     def log(self):
         print("-------------------------Batch Log------------------------")
         for key in self.__dict__.keys():
@@ -161,4 +168,3 @@ class Batch:
         for req in self.requests:
             req.log()
         print("----------------------------------------------------------")
-    

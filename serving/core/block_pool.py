@@ -237,6 +237,7 @@ class BlockPool:
         self.enable_caching = enable_caching
 
         self.blocks = [KVCacheBlock(i) for i in range(num_blocks)]
+        self._retired_blocks = []
         self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
         # block_hash -> KVCacheBlock. vLLM keeps a hash -> {block_id: block}
         # map because its block ids must stay stable for append-only block
@@ -370,6 +371,28 @@ class BlockPool:
 
     # -------------------- accounting --------------------
 
+    def resize_free_capacity(self, num_blocks):
+        """Resize free capacity without moving or reclaiming a live KV block."""
+        if num_blocks <= 0:
+            return False
+        delta = int(num_blocks) - self.num_blocks
+        if delta < 0:
+            if -delta > self.get_num_free_blocks():
+                return False
+            removed = self.free_block_queue.popleft_n(-delta)
+            for block in removed:
+                self._maybe_evict_cached_block(block)
+            self._retired_blocks.extend(removed)
+        elif delta > 0:
+            restored = self._retired_blocks[-delta:]
+            if restored:
+                del self._retired_blocks[-len(restored):]
+            added = [KVCacheBlock(len(self.blocks) + i) for i in range(delta - len(restored))]
+            self.blocks.extend(added)
+            self.free_block_queue.append_n(restored + added)
+        self.num_blocks = int(num_blocks)
+        return True
+
     def get_num_free_blocks(self):
         return self.free_block_queue.num_free_blocks
 
@@ -406,7 +429,8 @@ class BlockPool:
         for block in self.blocks:
             block.ref_cnt = 0
             block.reset_hash()
-        self.free_block_queue = FreeKVCacheBlockQueue(self.blocks)
+        retired_ids = {block.block_id for block in self._retired_blocks}
+        self.free_block_queue = FreeKVCacheBlockQueue([b for b in self.blocks if b.block_id not in retired_ids])
 
     def __repr__(self):
         return (f"BlockPool(tier={self.tier}, num_blocks={self.num_blocks}, "

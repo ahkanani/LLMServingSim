@@ -36,7 +36,7 @@ class Scheduler:
                  enable_prefix_caching, enable_prefix_sharing, prefix_pool, prefix_storage,
                  enable_chunked_prefill=False,
                  long_prefill_token_threshold=0, cxl_mem=0, ep_size=1, kv_cache_dtype='auto',
-                 npu_memory_utilization=1.0, reserve_full_isl=True):
+                 npu_memory_utilization=1.0, reserve_full_isl=True, native_pd=False):
         self.model = model
         self.config = get_config(model)
         self.node_id = node_id
@@ -50,6 +50,7 @@ class Scheduler:
         self.req_num = req_num
         self.start_npu = start_npu
         self.pd_type = pd_type
+        self.native_pd = native_pd
         self.enable_prefix_caching = enable_prefix_caching
         self.enable_prefix_sharing = enable_prefix_sharing
         self.enable_chunked_prefill = enable_chunked_prefill
@@ -330,6 +331,10 @@ class Scheduler:
         batch.fired.append(sys)
         batch.requests.extend(req for req, _, _ in scheduled)
         batch.scheduled_tokens = scheduled_tokens
+        from .expert_replay import TokenSpan
+        batch.token_spans = tuple(TokenSpan(req.id, req.expert_trace_request_id, req.original_input,
+                                           before, count, self.instance_id)
+                                 for req, count, before in scheduled)
         # Written down to a victim tier off the critical path, so it carries no
         # latency -- but the bytes still cost DRAM energy.
         batch.write_through = write_through_bytes
@@ -370,7 +375,7 @@ class Scheduler:
         batch.end.append(sys)
         # A prefill instance also waits for its paired decode NPUs, which
         # receive the streamed KV.
-        last_npu = self.num_npus * (2 if self.pd_type == "prefill" else 1) - 1
+        last_npu = self.num_npus * (2 if self.pd_type == "prefill" and not self.native_pd else 1) - 1
         if self.start_npu not in batch.end or (self.start_npu + last_npu) not in batch.end:
             return prompt_t, gen_t, end_reqs
 
@@ -414,7 +419,11 @@ class Scheduler:
                     # which is where this token has always been counted.
                     req.num_tokens_reached += 1
                     self.logger.info("Request #%d is prefill done, sent to decode instance", req.id)
-                    self.kv.free(req)
+                    if not self.native_pd or req.num_tokens_reached >= req.output:
+                        self.kv.free(req)
+                    if self.native_pd and req.num_tokens_reached >= req.output:
+                        req.add_latency(finish)
+                        self.done.append(req)
                     self._retire(req)
                     end_reqs.append(req)
                     continue
@@ -461,8 +470,11 @@ class Scheduler:
         self.batch_ids += 1
         return self.batch_ids
 
-    def add_request(self, req, is_init=True):
-        new_req = Request(*(req), is_init=is_init)
+    def add_request(self, req, is_init=True, expert_trace_request_id=None):
+        new_req = Request(*(req), is_init=is_init, expert_trace_request_id=expert_trace_request_id)
+        return self._enqueue_request(new_req)
+
+    def _enqueue_request(self, new_req):
         # Arrival order, which phase B relies on to stop at the first request
         # that has not arrived yet. Dynamically released agentic sub-requests
         # arrive mid-run, hence insort rather than append.

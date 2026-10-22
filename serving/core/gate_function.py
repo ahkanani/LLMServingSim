@@ -23,6 +23,7 @@ class RoutingResult:
     source_tokens: list         # [rank] -> token count originating from this rank before dispatch
     per_expert_tokens: list = None     # [expert_id] -> token-expert pair count
     tokens_by_rank_expert: list = None # [rank][expert_id] -> token-expert pair count
+    token_expert_ids: object = None    # immutable [real token][top-k] selections for TRACE
 
 
 class GateRouter:

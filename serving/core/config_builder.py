@@ -229,6 +229,11 @@ def _resolve_dp_groups(all_instances):
 
 def _compute_network_dims(instances):
     """Infer ASTRA-Sim topology dimensions from resolved instances."""
+    if any(inst.get("_native_pd", False) for inst in instances):
+        tp = instances[0]["tp_size"]
+        if any(inst["tp_size"] != tp or inst["pp_size"] != 1 for inst in instances):
+            raise ValueError("expert replay currently requires equal TP degrees and PP=1")
+        return [tp, sum(inst["num_npus"] for inst in instances) // tp]
     dp_groups = {}
     for inst in instances:
         dg = inst.get("dp_group")
@@ -354,7 +359,7 @@ def _sync_system_collective_dims(system_config_path, instances):
 
 # parse cluster configuration from JSON file and build config file for astra-sim
 def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading=False,
-                         enable_attn_offloading=False, inputs_root=None, enable_pim=None):
+                         enable_attn_offloading=False, inputs_root=None, enable_pim=None, native_pd=False):
     if enable_pim is None:
         enable_pim = enable_attn_offloading
     cluster_config_path = f'../{cluster_config_path}' # move out from astra-sim folder
@@ -493,6 +498,8 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         # and resolve parallelism configuration
         required_keys = ["model_name", "hardware", "npu_mem", "pd_type"]
         for instance in instances:
+            if native_pd:
+                instance["_native_pd"] = True
             for key in required_keys:
                 if key not in instance:
                     raise KeyError(f"Missing required key '{key}' in instance configuration.")
@@ -634,7 +641,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
             # Add sender NPUs in prefill instance
             effective_npus = num_npus
             if pd_type == "prefill":
-                effective_npus = num_npus * 2
+                effective_npus = num_npus if native_pd else num_npus * 2
                 prefill_instance.append(instance_id)
             elif pd_type == "decode":
                 decode_instance.append(instance_id)
@@ -711,7 +718,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
 
     total_npu = sum(
         inst["num_npus"] if inst["pd_type"] != "prefill"
-        else inst["num_npus"] * 2
+        else inst["num_npus"] * (1 if native_pd else 2)
         for inst in total_instances
     )
 

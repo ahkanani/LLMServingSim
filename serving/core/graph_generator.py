@@ -63,6 +63,8 @@ def _rows_digest(trace):
     """
     h = hashlib.blake2b(digest_size=16)
     h.update(trace.header_line.encode())
+    if trace.comm_groups:
+        h.update(repr(sorted(trace.comm_groups.items())).encode())
     h.update(b"\n")
     h.update("\n".join("\t".join(row) for row in trace.rows).encode())
     return h.hexdigest()
@@ -181,7 +183,10 @@ def generate_graph(batch, hardware, num_npus, node_id=0, instance_id=0, npu_offs
     converter = _get_llm_converter()(
         trace_path, output_path, num_npus, npu_offset, enable_local_offloading,
     )
-    converter.convert_rows(trace.header_line, indexed_cols(trace.rows))
+    if trace.comm_groups:
+        converter.convert_rows(trace.header_line, indexed_cols(trace.rows), comm_groups=trace.comm_groups)
+    else:
+        converter.convert_rows(trace.header_line, indexed_cols(trace.rows))
 
     _cache_store(cache_key, _et_names(workload_dir) - before)
     return

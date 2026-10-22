@@ -206,6 +206,74 @@ across the DP group, see
    1-token dummy batches go through routing exactly like real
    batches, so DP+EP results are consistent across waves.
 
+## Recorded decode replay
+
+`--expert-routing-policy TRACE` connects a recorded TracePack to the complete
+serving model. Prepare disjoint calibration and serving requests with
+`python -m workloads.generators moe-trace --help`, then pass the generated
+JSONL, `--expert-trace-pack`, and `--expert-policy-config` to `python -m serving`.
+The example cluster and policy configurations are under
+`configs/cluster/pim_experiments/expert_replay/` and `configs/expert_replay/`.
+
+```bash
+python -m workloads.generators moe-trace \
+  --trace-pack ../trace_packs/full/qwen3_235b_a22b_fp8/mmlu \
+  --output workloads/moe_replay/mmlu.jsonl \
+  --calibration-output workloads/moe_replay/calibration.json
+
+python -m serving \
+  --cluster-config configs/cluster/pim_experiments/expert_replay/qwen3_235b_h200.json \
+  --expert-routing-policy TRACE \
+  --expert-trace-pack ../trace_packs/full/qwen3_235b_a22b_fp8/mmlu \
+  --expert-policy-config configs/expert_replay/adaptive.json \
+  --dataset workloads/moe_replay/mmlu.jsonl \
+  --output outputs/moe_replay/sim.csv
+```
+
+Replay uses immutable scheduled token ranges. Prompt tokens use a labeled
+balanced approximation; generated-token routes come from the recorded request,
+decode position, and layer, including when preemption causes recomputation.
+Prefill produces the first output token, so a request with no recorded decode
+forwards finishes on prefill without a KV handoff.
+
+One policy controller owns each decode EP group. It predicts from completed
+history, reserves and executes feasible paired copy migrations, executes the
+next group forward, then updates history once. GPU/PIM/BOTH placement reserves
+physical weight memory; only the remaining GPU capacity is available to KV.
+Migrations that cannot reserve free memory are deferred without displacing live KV.
+PIM channel assignments remain fixed for each expert across forwards.
+
+The replay driver uses actual GPU endpoints and blocking KV handoffs after
+prefill. Explicit communicator IDs distinguish TP and EP groups. Collective
+algorithms remain rings over the configured network. Dummy batches and padded
+communication buffers never add recorded expert demand. These semantics are
+separate from the legacy P/D and padded MoE paths described above.
+
+Use `python -m serving.replay_experiments --help` for the reproducible comparison
+matrix. It prepares the same evaluation requests and arrivals for each variant,
+derives arrival rates from a GPU baseline, and supports a separately labeled
+memory-pressure budget. The per-request CSV has a neighboring `.replay.json`
+with residency, migrations, timing, coverage, and profile provenance.
+Set `EXPERT_TRACE_ROOT` when launching `scripts/docker-sim.sh` to mount the
+external archive read-only at `/traces`. Pass its container path to the commands above.
+
+### Timing limitations and profiling TODO
+
+The supplied Qwen PIM CSV is synthetic. Replay preserves its current
+**per-expert** interpretation: lookup at that expert's token count and the
+layer's active PIM expert count, with serialization on shared channels.
+Activation transfers and migration copies are charged separately.
+Migration copies share the configured external link bandwidth, aggregated per
+direction and serialized during the blocking migration phase. The policy's
+PIM bandwidth parameter is also an explicit synthetic assumption, not a measured
+device specification.
+
+**TODO: profile rank-local partial-top-k MoE execution**, including fewer active
+experts than the model's top-k and uneven per-expert token counts. The current
+GPU table can map such a query to its lowest measured expert-count row. This
+iteration retains that behavior and reports out-of-coverage lookup counts;
+exact expert selections do not remove this latency-estimation limitation.
+
 ## What's next
 
 - **[Parallelism mechanics](./parallelism-mechanics)**: what the

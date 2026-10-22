@@ -301,15 +301,17 @@ def main():
                         help='request routing policy across instances: LOAD (vLLM-style weighted least-loaded, default), '
                         'RR (round-robin), RAND (random), CUSTOM (user-defined)')
     parser.add_argument('--expert-routing-policy', type=str,
-                        choices=['BALANCED', 'RR', 'RAND', 'CUSTOM'],
+                        choices=['BALANCED', 'RR', 'RAND', 'CUSTOM', 'TRACE'],
                         default='BALANCED',
                         help='expert token routing policy for MoE models: '
                         'BALANCED (default; analytical pigeonhole approximation of '
                         'a trained load-balanced learned gate), '
                         'RR (round-robin), RAND (uniform random per token), '
-                        'CUSTOM (user-defined)')
+                        'CUSTOM (user-defined), TRACE (recorded decode expert selections)')
     parser.add_argument('--expert-routing-distribution-csv', type=str, default=None,
                         help='CSV containing a custom per-expert routing distribution for CUSTOM routing')
+    parser.add_argument('--expert-trace-pack', help='Recorded expert TracePack directory for TRACE routing')
+    parser.add_argument('--expert-policy-config', help='YAML/JSON replay policy and calibration configuration')
     parser.add_argument('--enable-block-copy', action=argparse.BooleanOptionalAction,
                         default=True,
                         help='Replay one transformer block\'s trace across every '
@@ -408,6 +410,10 @@ def main():
     print_banner()
     print_input_config(args=args)
     flush.stdout.flush()
+
+    if args.expert_routing_policy == 'TRACE':
+        from serving.core.replay_runtime import run_replay
+        return run_replay(args, astra_sim, run_paths)
     
     _dtype_to_bits = {'float16': 16, 'bfloat16': 16, 'float32': 32, 'fp8': 8, 'int8': 8}
     request_routing_policy=args.request_routing_policy

@@ -142,6 +142,7 @@ class Router:
         self._next_request_id += 1
         req_data = {
             'index': req_id,
+            'expert_trace_request_id': row.get('expert_trace_request_id'),
             'input_toks': int(row['input_toks']),
             'output_toks': int(row['input_toks'] + row['output_toks']),
             'arrival_time_ns': int(row['arrival_time_ns']),
@@ -207,13 +208,13 @@ class Router:
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
                     req_data.get('input_hash_ids', []), req_data.get('output_hash_ids', []),
-                ], is_init=self._is_init)
+                ], is_init=self._is_init, expert_trace_request_id=req_data.get('expert_trace_request_id'))
             else:
                 sched.add_request([
                     req_data['index'], sched.model,
                     req_data['input_toks'], req_data['output_toks'],
                     req_data['arrival_time_ns'], sched.instance_id,
-                ], is_init=self._is_init)
+                ], is_init=self._is_init, expert_trace_request_id=req_data.get('expert_trace_request_id'))
 
             self._pending_idx += 1
             routed += 1

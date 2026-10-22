@@ -112,6 +112,7 @@ class TraceCtx:
     ep_dim: list       # involved_dim for EP collectives (ALLTOALL), None = all dims
     dp_sum_total_len: int  # sum of total_len across DP group (0 = DP inactive). Captures the post-AG gathered size for MoE compute; dummy batches are pre-padded to max by serving/__main__.py so the sum reflects vLLM's CUDA-graph padding.
     expert_offload_config: object = None  # ExpertOffloadConfig or None; consumed by Phase E expert-PIM trace generation.
+    activation_fp: int = 0  # replay separates BF16 activations from FP8 weights
 
 
 @dataclass
@@ -979,6 +980,7 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
 
 
 def _build_batch_ctx(batch, ctx):
+    ctx.activation_fp = 2 if batch.expert_replay else ctx.fp
     # batch.total_len is the number of tokens actually computed this iteration:
     # the scheduler builds it from chunk_size = original_input - num_computed_tokens,
     # and num_computed_tokens already absorbs any prefix-cache hit, so no further
@@ -1016,7 +1018,8 @@ def _build_batch_ctx(batch, ctx):
     bctx = BatchCtx(batch, total_len, prefill_chunk, kv_prefill, n_decode,
                     kv_decode_mean, kv_decode_max, kv_decode_min,
                     lm_head_len, decode_lens, channel_split)
-    bctx.expert_offload_active = _is_expert_offload_active(ctx, bctx)
+    bctx.expert_offload_active = (False if batch.expert_round_plan is not None
+                                else _is_expert_offload_active(ctx, bctx))
     return bctx
 
 
@@ -1068,6 +1071,11 @@ def _emit_layer(ctx, bctx, layer_name, lines, power_acc, batch_tag='NONE', layer
         inp, wt, out = calculate_sizes(ctx.model, layer_name, bctx.total_len,
                                        parallel=ctx.tp_size, fp=ctx.fp)
 
+    if ctx.activation_fp != ctx.fp:
+        if layer_name != 'embedding':
+            inp = inp * ctx.activation_fp // ctx.fp
+        if layer_name != 'sampler':
+            out = out * ctx.activation_fp // ctx.fp
     wt_loc = get_device(ctx.placement, layer_num, layer_name, "weights")
 
     lines.append((layer_name, str(latency_ns), input_loc, str(inp), wt_loc,
@@ -1109,6 +1117,8 @@ def _tp_comm(ctx, layer_name, total_len, collective='ALLREDUCE'):
     if ctx.tp_size <= 1:
         return 0, 'NONE'
     _, _, out = calculate_sizes(ctx.model, layer_name, total_len, parallel=ctx.tp_size, fp=ctx.fp)
+    if ctx.activation_fp and ctx.activation_fp != ctx.fp:
+        out = out * ctx.activation_fp // ctx.fp
     return out, collective
 
 
@@ -1542,6 +1552,55 @@ def _split_expert_offload_work(ctx, bctx, routing, layer_num):
     )
 
 
+def _emit_replayed_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_tag):
+    batch = bctx.batch
+    plan, controller = batch.expert_round_plan, batch.expert_controller
+    layer = plan.layers[layer_num]
+    hidden, experts, activation_bytes = ctx.config['hidden_size'], controller.pack.num_experts, 2
+    dispatch_size = plan.source_buffer_tokens * (hidden + experts) * activation_bytes
+    combine_size = plan.source_buffer_tokens * ctx.ep_total * hidden * activation_bytes
+    cold = [(expert, count) for expert, count in enumerate(layer.pim_counts) if count]
+    # TODO: rank-local partial-top-k/uneven routing profiles are not yet available.
+    # Keep legacy lookup behavior, but expose every unsupported query in reports.
+    table = _tp_tables(ctx.perf_db, 1)['moe']
+    ae_values = table['activated_experts_vals']
+    for local_rank in range(ctx.local_ep):
+        rank = batch.expert_ep_offset + local_rank
+        lines.append((f"EXPERT {local_rank} " +
+                      (f"ALLGATHER {dispatch_size}" if local_rank == 0 and ctx.ep_total > 1 else "NONE 0"),))
+        tokens = layer.gpu_routing.local_tokens[rank]
+        activated = layer.gpu_routing.activated_experts[rank]
+        if tokens:
+            latency = _lookup_moe(ctx.perf_db, tokens, activated)
+            controller.coverage['gpu_moe_lookups'] += 1
+            if activated < min(ae_values) or activated > max(ae_values):
+                controller.coverage['activated_experts_outside_profile'] += 1
+            token_keys = [key for row in table['rows'] for key in row['keys']]
+            if tokens < min(token_keys) or tokens > max(token_keys):
+                controller.coverage['tokens_outside_profile'] += 1
+            size = tokens * hidden * activation_bytes
+            lines.append(('expert_hot', str(latency), 'LOCAL', str(size), 'LOCAL',
+                          str(activated * controller.weight_bytes), 'LOCAL', str(size), 'NONE', '0', batch_tag))
+        if local_rank == 0 and batch.expert_pim_coordinator and cold:
+            profile = controller.pim_profile
+            transfer = ctx.expert_offload_config.activation_transfer
+            byte_count = sum(count for _, count in cold) * hidden * activation_bytes
+            _emit_pim_expert_transfer_row(ctx, lines, name=f'xfer_in_L{layer_num}',
+                latency_ns=transfer.npu_to_pim_time_ns(byte_count), transfer_bytes=byte_count, direction='in')
+            work = []
+            for expert, count in cold:
+                work.append(ExpertPIMWorkItem(layer_num, expert, count, count * hidden * activation_bytes,
+                    controller.weight_bytes, count * hidden * activation_bytes,
+                    controller.weight_bytes + 2 * count * hidden * activation_bytes,
+                    controller.channel(layer_num, expert), profile.lookup_ns(count, len(cold)), len(cold)))
+            _emit_pim_expert_work_items(ctx, lines, power_acc, work)
+            _emit_pim_expert_transfer_row(ctx, lines, name=f'xfer_out_L{layer_num}',
+                latency_ns=transfer.pim_to_npu_time_ns(byte_count), transfer_bytes=byte_count, direction='out')
+            lines.append(('expert_pim_join', '1', 'LOCAL', '0', 'LOCAL', '0', 'LOCAL', '0', 'NONE', '0', 'NONE'))
+            controller.stats['activation_transfer_bytes'] += 2 * byte_count
+    lines.append((f"EXPERT END REDUCESCATTER {combine_size}" if ctx.ep_total > 1 else 'EXPERT END NONE 0',))
+
+
 def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag='NONE'):
     """Emit MoE block: dispatch ALLTOALL + per-EP-rank expert compute + combine ALLTOALL.
 
@@ -1550,6 +1609,9 @@ def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_
     ALLTOALL is handled by ASTRA-Sim with involved_dim scoping for DP groups,
     or as a simple ALLTOALL for local EP groups.
     """
+    if bctx.batch.expert_round_plan is not None:
+        _emit_replayed_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_tag)
+        return
     ep_total = ctx.ep_total
 
     # MoE compute uses ``bctx.total_len`` (= per-rank padded count after
@@ -2228,6 +2290,7 @@ class TraceData:
     header_line: str
     rows: list
     path: str
+    comm_groups: object = None
 
 
 _TRACE_ROW_FIELDS = 11

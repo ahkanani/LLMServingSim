@@ -9,6 +9,12 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"   # .../scripts
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"                    # .../LLMServingSim
 
+# Optionally expose the external recorded-route archive read-only.
+TRACE_MOUNTS=()
+if [[ -n "${EXPERT_TRACE_ROOT:-}" ]]; then
+  TRACE_MOUNTS=(-v "$(realpath "$EXPERT_TRACE_ROOT"):/traces:ro")
+fi
+
 # The image ships Python 3.10 and the ASTRA-Sim build deps, but none of the
 # packages the Python side needs. Every one below is imported by code that runs
 # in this container:
@@ -21,6 +27,7 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"                    # .../LLMServingSim
 docker run --name servingsim_docker \
   -it \
   -v "$REPO_ROOT":/app/LLMServingSim \
+  "${TRACE_MOUNTS[@]}" \
   -w /app/LLMServingSim \
   astrasim/tutorial-micro2024 \
   bash -c "pip3 install pyyaml pyinstrument rich \
