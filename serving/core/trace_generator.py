@@ -55,6 +55,8 @@ def resolve_variant(dtype, kv_cache_dtype, model_config=None):
     weight = dtype
     if not weight and model_config is not None:
         weight = model_config.get("torch_dtype")
+    if model_config and model_config.get('quantization_config', {}).get('quant_method') == 'awq':
+        weight = 'awq'
     parts = [_short_dtype(weight) if weight else "default"]
     if kv_cache_dtype and kv_cache_dtype != "auto":
         parts.append(f"kv{_short_dtype(kv_cache_dtype)}")
@@ -385,7 +387,9 @@ def _build_moe_table(df):
         by_tok = grouped[ae]
         tok_keys = sorted(by_tok)
         rows.append({"keys": tok_keys, "values": [by_tok[k] for k in tok_keys]})
-    return {"activated_experts_vals": ae_vals, "rows": rows}
+    token_keys = [key for row in rows for key in row['keys']]
+    return {"activated_experts_vals": ae_vals, "rows": rows,
+            "token_min": min(token_keys), "token_max": max(token_keys)}
 
 
 def _load_perf_db(hardware, model, variant, tp_needed, model_type):
@@ -536,6 +540,36 @@ def _build_tp_tables(tp_dir):
     return tables
 
 
+def dense_ffn_roofline_rows(config, tp):
+    """Explicit fallback for unmeasured dense FFNs; never replaces measured rows.
+
+    Ideal HBM/compute roofline, excluding launch and quantization overheads.
+    Weights use their stored precision, activations the configured byte width.
+    Tensor peaks must be specified without structured sparsity.
+    """
+    spec = config['dense_ffn_roofline']
+    hidden = config['hidden_size']
+    width = config.get('intermediate_size_mlp', config['intermediate_size']) / tp
+    weight_bytes = spec['weight_bits'] / 8
+    activation_bytes = spec['activation_bytes']
+    rows = []
+    for tokens in spec['tokens']:
+        shapes = (
+            ('gate_up_proj', 4 * tokens * hidden * width,
+             2 * hidden * width * weight_bytes + tokens * (hidden + 2 * width) * activation_bytes,
+             spec['matrix_flops_s']),
+            ('act_fn', 5 * tokens * width, 3 * tokens * width * activation_bytes,
+             spec['vector_flops_s']),
+            ('down_proj', 2 * tokens * hidden * width,
+             hidden * width * weight_bytes + tokens * (hidden + width) * activation_bytes,
+             spec['matrix_flops_s']),
+        )
+        for layer, flops, size, peak in shapes:
+            time_us = max(flops / peak, size / spec['memory_bandwidth_bytes_s']) * 1e6
+            rows.append(dict(layer=layer, tokens=tokens, time_us=time_us))
+    return rows
+
+
 def _tp_tables(perf_db, tp):
     """Fetch the category-table dict for a given TP degree, building it on
     first use, with a clear error if the TP wasn't profiled.
@@ -562,6 +596,19 @@ def _tp_tables(perf_db, tp):
             f"{perf_db['available_tps']}"
         )
     tables = _build_tp_tables(os.path.join(perf_db["root"], f"tp{tp}"))
+    config = get_config(perf_db['model'])
+    roofline = config.get('dense_ffn_roofline')
+    if roofline:
+        if roofline['hardware'] != perf_db['hardware']:
+            raise ValueError('dense FFN roofline hardware does not match simulation')
+        rows = pd.DataFrame(dense_ffn_roofline_rows(config, tp))
+        rows['latency_ns'] = (rows['time_us'] * 1000).round().astype(int).clip(lower=1)
+        dense = tables.setdefault('dense', {})
+        for name, table in _build_1d_table(rows, 'layer', 'tokens').items():
+            if name not in dense:
+                dense[name] = table
+                logger.warning('Using estimated dense FFN roofline: %s/%s tp%s %s',
+                               perf_db['hardware'], perf_db['model'], tp, name)
     perf_db["tables"][tp] = tables
     return tables
 
@@ -981,6 +1028,8 @@ def _build_trace_ctx(hardware, model, config, tp_size, pp_size, local_ep, ep_tot
 
 def _build_batch_ctx(batch, ctx):
     ctx.activation_fp = 2 if batch.expert_replay else ctx.fp
+    if batch.expert_round_plan is not None and batch.expert_controller.group_mode:
+        ctx.activation_fp = 1
     # batch.total_len is the number of tokens actually computed this iteration:
     # the scheduler builds it from chunk_size = original_input - num_computed_tokens,
     # and num_computed_tokens already absorbs any prefix-cache hit, so no further
@@ -1224,7 +1273,13 @@ def _emit_npu_attention(ctx, bctx, lines, power_acc, layer_num, batch_tag='NONE'
     """Emit NPU attention (unified prefill+decode lookup)."""
     if bctx.prefill_chunk == 0 and bctx.n_decode == 0:
         return
-    _emit_layer(ctx, bctx, "attention", lines, power_acc, batch_tag, layer_num)
+    # An MLA wrapper includes o_proj compute; its single-GPU profile excludes
+    # the tensor-parallel output reduction. Emit that collective once here.
+    comm_size, comm_type = (0, 'NONE')
+    if ctx.perf_db['architecture'].get('attention_output_allreduce', False):
+        comm_size, comm_type = _tp_comm(ctx, 'o_proj', bctx.total_len)
+    _emit_layer(ctx, bctx, "attention", lines, power_acc, batch_tag, layer_num,
+                comm_type=_with_dim(comm_type, ctx.tp_dim), comm_size=comm_size)
 
 
 def _batch_has_decode_tokens(bctx):
@@ -1555,33 +1610,61 @@ def _split_expert_offload_work(ctx, bctx, routing, layer_num):
 def _emit_replayed_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_tag):
     batch = bctx.batch
     plan, controller = batch.expert_round_plan, batch.expert_controller
-    layer = plan.layers[layer_num]
-    hidden, experts, activation_bytes = ctx.config['hidden_size'], controller.pack.num_experts, 2
+    layer = plan.layers[controller.layer_index[layer_num]]
+    hidden, experts = ctx.config['hidden_size'], controller.pack.num_experts
+    activation_bytes = 1 if controller.group_mode else 2
     dispatch_size = plan.source_buffer_tokens * (hidden + experts) * activation_bytes
     combine_size = plan.source_buffer_tokens * ctx.ep_total * hidden * activation_bytes
+    network = layer.network_exchange is not None
+    if network:
+        # Logical markers are expanded into per-rank, hierarchical ALLTOALLV
+        # nodes by replay_graph; these sizes describe aggregate stage payloads.
+        dispatch_size = sum(sum(map(sum, m)) for m in layer.network_exchange.stages()[:3]) * hidden
+        combine_size = sum(sum(map(sum, m)) for m in layer.network_exchange.stages()[3:]) * hidden
+    dispatch_type = 'ALLTOALL' if network else 'ALLGATHER'
+    combine_type = 'ALLTOALL' if network else 'REDUCESCATTER'
     cold = [(expert, count) for expert, count in enumerate(layer.pim_counts) if count]
     # TODO: rank-local partial-top-k/uneven routing profiles are not yet available.
     # Keep legacy lookup behavior, but expose every unsupported query in reports.
-    table = _tp_tables(ctx.perf_db, 1)['moe']
+    moe_db = controller.gpu_moe_db if controller.gpu_moe_db is not None else ctx.perf_db
+    table = _tp_tables(moe_db, 1)['moe']
     ae_values = table['activated_experts_vals']
     for local_rank in range(ctx.local_ep):
         rank = batch.expert_ep_offset + local_rank
         lines.append((f"EXPERT {local_rank} " +
-                      (f"ALLGATHER {dispatch_size}" if local_rank == 0 and ctx.ep_total > 1 else "NONE 0"),))
+                      (f"{dispatch_type} {dispatch_size}" if local_rank == 0 and ctx.ep_total > 1 else "NONE 0"),))
         tokens = layer.gpu_routing.local_tokens[rank]
         activated = layer.gpu_routing.activated_experts[rank]
         if tokens:
-            latency = _lookup_moe(ctx.perf_db, tokens, activated)
+            latency = _lookup_moe(moe_db, tokens, activated)
+            if controller.profile_cost is not None and latency != layer.gpu_runtime_ns[rank]:
+                raise RuntimeError('adaptive GPU estimate differs from emitted profile timing')
+            if controller.group_mode:
+                controller.gpu_runtime_by_rank[rank] += latency
             controller.coverage['gpu_moe_lookups'] += 1
             if activated < min(ae_values) or activated > max(ae_values):
                 controller.coverage['activated_experts_outside_profile'] += 1
-            token_keys = [key for row in table['rows'] for key in row['keys']]
-            if tokens < min(token_keys) or tokens > max(token_keys):
+            if tokens < table['token_min'] or tokens > table['token_max']:
                 controller.coverage['tokens_outside_profile'] += 1
             size = tokens * hidden * activation_bytes
             lines.append(('expert_hot', str(latency), 'LOCAL', str(size), 'LOCAL',
                           str(activated * controller.weight_bytes), 'LOCAL', str(size), 'NONE', '0', batch_tag))
         if local_rank == 0 and batch.expert_pim_coordinator and cold:
+            if controller.group_mode:
+                if controller.groups.attachment == 'network':
+                    continue
+                transfer = ctx.expert_offload_config.activation_transfer
+                byte_count = len(layer.pim_group_tokens[0]) * hidden
+                _emit_pim_expert_transfer_row(ctx, lines, name=f'xfer_in_L{layer_num}',
+                    latency_ns=transfer.npu_to_pim_time_ns(byte_count), transfer_bytes=byte_count, direction='in')
+                lines.extend([('PIM 0',),
+                    (f'expert_pim_group_L{layer_num}_G0', str(layer.pim_group_runtime_ns[0]),
+                     f'REMOTE:{ctx.node_id}.0', '0', 'LOCAL', '0', f'REMOTE:{ctx.node_id}.0', '0',
+                     'NONE', '0', 'EXPERT'), ('PIM END',)])
+                _emit_pim_expert_transfer_row(ctx, lines, name=f'xfer_out_L{layer_num}',
+                    latency_ns=transfer.pim_to_npu_time_ns(byte_count), transfer_bytes=byte_count, direction='out')
+                lines.append(('expert_pim_join', '1', 'LOCAL', '0', 'LOCAL', '0', 'LOCAL', '0', 'NONE', '0', 'NONE'))
+                continue
             profile = controller.pim_profile
             transfer = ctx.expert_offload_config.activation_transfer
             byte_count = sum(count for _, count in cold) * hidden * activation_bytes
@@ -1598,7 +1681,7 @@ def _emit_replayed_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_tag):
                 latency_ns=transfer.pim_to_npu_time_ns(byte_count), transfer_bytes=byte_count, direction='out')
             lines.append(('expert_pim_join', '1', 'LOCAL', '0', 'LOCAL', '0', 'LOCAL', '0', 'NONE', '0', 'NONE'))
             controller.stats['activation_transfer_bytes'] += 2 * byte_count
-    lines.append((f"EXPERT END REDUCESCATTER {combine_size}" if ctx.ep_total > 1 else 'EXPERT END NONE 0',))
+    lines.append((f"EXPERT END {combine_type} {combine_size}" if ctx.ep_total > 1 else 'EXPERT END NONE 0',))
 
 
 def _emit_moe_block(ctx, bctx, lines, power_acc, layer_num, batch_id_str, batch_tag='NONE'):
@@ -1846,7 +1929,9 @@ def _emit_post_attn_layers(ctx, bctx, layer_num, lines, power_acc, batch_id_str,
     _emit_sequence(ctx, bctx, layer_num, _sequence(ctx.perf_db, "post_attn"),
                    lines, power_acc, batch_tag)
     # MLP: either the dense FFN stack or a single MoE block.
-    if ctx.is_moe:
+    moe_layers = ctx.config.get('moe_layer_ids')
+    routed = ctx.is_moe and (moe_layers is None or layer_num in moe_layers)
+    if routed:
         moe_seq = _sequence(ctx.perf_db, "mlp_moe")
         for layer_name in moe_seq:
             if layer_name == "moe":

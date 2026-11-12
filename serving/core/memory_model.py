@@ -172,7 +172,12 @@ class MemoryModel():
 
         _, embedding, _ = calculate_sizes(self.model, 'embedding', 1, parallel=tp, fp=fp)
         weight += embedding
-        weight += self._get_weight_per_block(tp, ep, fp) * (self.n_layer // pp)
+        if 'moe_layer_ids' in self.config:
+            blocks = [self._get_weight_per_block(tp, ep, fp, layer) for layer in range(self.n_layer)]
+            # Conservative PP bound, as above, for heterogeneous block types.
+            weight += sum(sorted(blocks, reverse=True)[:(self.n_layer + pp - 1) // pp])
+        else:
+            weight += self._get_weight_per_block(tp, ep, fp) * (self.n_layer // pp)
         _, ln_f, _ = calculate_sizes(self.model, 'final_layernorm', 1, parallel=tp, fp=fp)
         weight += ln_f
         _, lm_head, _ = calculate_sizes(self.model, 'lm_head', 1, parallel=tp, fp=fp)
@@ -184,7 +189,7 @@ class MemoryModel():
         )
         return weight
 
-    def _get_weight_per_block(self, tp, ep, fp):
+    def _get_weight_per_block(self, tp, ep, fp, layer=0):
         """Per-block weight: dense layers use TP, MoE experts use EP."""
         block_weight = 0
         _, ln_w, _ = calculate_sizes(self.model, 'layernorm', 1, parallel=tp, fp=fp)
@@ -194,9 +199,13 @@ class MemoryModel():
         _, o_w, _ = calculate_sizes(self.model, 'o_proj', 1, parallel=tp, fp=fp)
         block_weight += o_w
         block_weight += ln_w  # post layernorm (same weight size)
-        if self.is_moe:
+        routed = self.is_moe and layer in self.config.get('moe_layer_ids', range(self.n_layer))
+        if routed:
             _, moe_w, _ = calculate_sizes(self.model, 'moe', 1, parallel=ep, fp=fp)
             block_weight += moe_w
+            shared = self.config.get('n_shared_experts', 0)
+            if shared:
+                block_weight += shared * calculate_expert_sizes(self.model, 0, fp=fp)[1] // tp
         else:
             _, ffn1_w, _ = calculate_sizes(self.model, 'gate_up_proj', 1, parallel=tp, fp=fp)
             block_weight += ffn1_w
@@ -212,6 +221,9 @@ class MemoryModel():
         # return batch_size = 1 to caclulate max batch_size in scheduler
 
         # K & V multiply 2
+        if self.config.get('compressed_kv_cache'):
+            width = self.config['kv_lora_rank'] + self.config['qk_rope_head_dim']
+            return width * seq * self.n_layer * self.kv_fp // self.pp_size
         return 2 * self.kv_dim * seq * self.n_layer * self.kv_fp // self.num_npus
 
     def get_total_kv(self, req):
@@ -232,6 +244,8 @@ class MemoryModel():
         more at wider GQA ratios. It also honours ``kv_cache_dtype``, which the
         activation size did not.
         """
+        if self.config.get('compressed_kv_cache'):
+            return self.get_kv(num_tokens)
         return 2 * self.kv_dim * num_tokens * self.n_layer * self.kv_fp // self.tp_size
 
     def free_weight(self):
@@ -476,7 +490,10 @@ def calculate_expert_sizes(model, tokens, fp=2):
         raise ValueError(f"fp must be positive bytes per element, got {fp}")
 
     input_size = tokens * n_embd * fp
-    weight_size = 3 * n_embd * int(moe_ffn_dim) * fp
+    weight_bits = int(config.get('expert_weight_bits', fp * 8))
+    if weight_bits not in (4, 8, 16, 32):
+        raise ValueError('expert_weight_bits must be 4, 8, 16, or 32')
+    weight_size = 3 * n_embd * int(moe_ffn_dim) * weight_bits // 8
     output_size = tokens * n_embd * fp
     return input_size, weight_size, output_size
 
@@ -497,7 +514,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     kv_head = config.get("num_key_value_heads", n_head)  # fallback to n_head if not defined
     q_dim = n_head * head_dim       # total Q projection output dim
     kv_dim = kv_head * head_dim     # total KV projection output dim
-    ffn_dim = config.get("intermediate_size", config.get("ffn_dim"))  # dense FFN dim
+    ffn_dim = config.get("intermediate_size_mlp", config.get("intermediate_size", config.get("ffn_dim")))
     moe_ffn_dim = config.get("moe_intermediate_size", ffn_dim)  # per-expert FFN dim (may differ from dense)
     # Same both-name fallback as MemoryModel.__init__ — HF / Qwen use
     # ``num_experts`` while Mistral uses ``num_local_experts``.
@@ -506,6 +523,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     )
 
     p = max(int(parallel), 1)
+    weight_fp = config.get('linear_weight_bits', fp * 8) / 8
 
     # NOTE (vLLM-style assumptions):
     # NOTE (vLLM-style assumptions):
@@ -556,17 +574,26 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
     # ----------------- QKV Projection (fused) -----------------
     elif layer_name == "qkv_proj":
         input_size = length * n_embd * fp
-        weight_size = n_embd * ((q_dim + 2 * kv_dim) // p) * fp
+        if config.get('compressed_kv_cache'):
+            q_rank, kv_rank = config['q_lora_rank'], config['kv_lora_rank']
+            rope, nope, value = config['qk_rope_head_dim'], config['qk_nope_head_dim'], config['v_head_dim']
+            parameters = (n_embd * (q_rank + kv_rank + rope)
+                          + q_rank * n_head * (nope + rope) // p
+                          + kv_rank * n_head * (nope + value) // p)
+            weight_size = int(parameters * weight_fp) + (q_rank + kv_rank) * fp
+        else:
+            weight_size = int(n_embd * ((q_dim + 2 * kv_dim) // p) * weight_fp)
         output_size = length * ((q_dim + 2 * kv_dim) // p) * fp
 
     elif layer_name == "o_proj":
-        input_size = length * (q_dim // p) * fp
-        weight_size = (q_dim // p) * n_embd * fp
+        projection_dim = n_head * config['v_head_dim'] if config.get('compressed_kv_cache') else q_dim
+        input_size = length * (projection_dim // p) * fp
+        weight_size = int((projection_dim // p) * n_embd * weight_fp)
         output_size = length * n_embd * fp
 
     elif layer_name == "gate_up_proj":
         input_size = length * n_embd * fp
-        weight_size = n_embd * 2 * (ffn_dim // p) * fp
+        weight_size = int(n_embd * 2 * (ffn_dim // p) * weight_fp)
         output_size = length * 2 * (ffn_dim // p) * fp
 
     elif layer_name == "act_fn":
@@ -576,7 +603,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
 
     elif layer_name == "down_proj":
         input_size = length * (ffn_dim // p) * fp
-        weight_size = (ffn_dim // p) * n_embd * fp
+        weight_size = int((ffn_dim // p) * n_embd * weight_fp)
         output_size = length * n_embd * fp
 
     elif layer_name == "sampler":
@@ -588,7 +615,7 @@ def calculate_sizes(model, layer_name, length, kv_len=None, pim=False, parallel=
         experts_per_rank = num_local_experts // p
         input_size = length * n_embd * fp
         weight_size = (n_embd * num_local_experts * fp  # gate (replicated)
-                     + experts_per_rank * 3 * n_embd * moe_ffn_dim * fp)  # local experts
+                     + experts_per_rank * calculate_expert_sizes(model, 0, fp=fp)[1])
         output_size = length * n_embd * fp
 
     elif layer_name == "moe_expert":

@@ -14,6 +14,7 @@ __pycache__/
 
 # Ignore bench results
 bench/results/
+tests/
 
 # Ignore scratch simulation output. The committed example runs under
 # outputs/example_*.csv stay tracked; everything else in outputs/ is
@@ -22,6 +23,8 @@ bench/results/
 outputs/*
 !outputs/example_*.csv
 astra-sim/inputs/runs/
+profiler/synthetic_moe.py
+scripts/generate_presentation_figures.py
 
 # AI agent cache files
 .vscode/

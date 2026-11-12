@@ -1,0 +1,58 @@
+# DeepSeek V3 / Kimi: consume the measured MLA-wrapper and MoE CSV categories.
+attention_output_allreduce: true
+
+sequence:
+  prologue:  [embedding]
+  pre_attn:  [layernorm, attention]
+  post_attn: [layernorm]
+  mlp_dense: [gate_up_proj, act_fn, down_proj]
+  mlp_moe:   [moe]
+  head:      [final_layernorm, lm_head, sampler]
+
+catalog:
+  dense:
+    embedding:
+      vllm: VocabParallelEmbedding
+    layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2DecoderLayer
+      tp_stable: true
+    kv_a_proj:
+      vllm: ReplicatedLinear
+      within: DeepseekV2MLAAttention
+      tp_stable: true
+    kv_a_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2MLAAttention
+      tp_stable: true
+    rotary_emb:
+      vllm: DeepseekScalingRotaryEmbedding
+      tp_stable: true
+    o_proj:
+      vllm: RowParallelLinear
+      within: MultiHeadLatentAttentionWrapper
+    gate_up_proj:
+      vllm: MergedColumnParallelLinear
+      within: DeepseekV2MLP
+    act_fn:
+      vllm: SiluAndMul
+      within: DeepseekV2MLP
+    down_proj:
+      vllm: RowParallelLinear
+      within: DeepseekV2MLP
+    final_layernorm:
+      vllm: RMSNorm
+      within: DeepseekV2ForCausalLM
+      tp_stable: true
+  per_sequence:
+    lm_head:
+      vllm: LogitsProcessor
+    sampler:
+      vllm: Sampler
+      tp_stable: true
+  attention:
+    attention:
+      vllm: MultiHeadLatentAttentionWrapper
+  moe:
+    moe:
+      vllm: DeepseekV2MoE

@@ -16,12 +16,22 @@
     "extra_copy_fraction": 0.25
   },
   "migration": {
-    "mode": "predictive_budgeted_regret",
-    "budget_pairs_per_step": "auto"
+    "mode": "frequency_hysteresis",
+    "interval": 64,
+    "fast_window": 8,
+    "cooldown": 4
   },
   "scheduler": {
     "policy": "placement_greedy",
     "latency_combine_mode": "max",
-    "oracle_comparison": true
-  }
+    "oracle_comparison": false
+  },
+  "hysteresis_options": {
+    "relative_margin": 0.25,
+    "persistence": 1,
+    "gate": "anchored"
+  },
+  "ssd_read_budget_gib": null,
+  "ssd_queue_policy": "newest_first",
+  "calibration_batch_size": 128
 }

@@ -239,7 +239,14 @@ class ReplayBackendTests(unittest.TestCase):
             dataset = root / 'workload.jsonl'
             dataset.write_text(''.join(json.dumps(dict(input_toks=r['prefill_length'], output_toks=r['decode_length'] + 1,
                 arrival_time_ns=1, expert_trace_request_id=r['request_id'])) + '\n' for r in list(pack.records.values())[1:]))
-            cluster = json.loads((ROOT / 'configs/cluster/pim_experiments/expert_replay/qwen3_235b_h200.json').read_text())
+            cluster = json.loads((ROOT / 'configs/cluster/pim_experiments/expert_replay/qwen3_235b_h200_1x16.json').read_text())
+            cluster.pop('expert_replay')
+            cluster.update(network_topology='Switch', link_bw=400, link_latency=936.25)
+            for instance in cluster['nodes'][0]['instances']:
+                if instance['pd_type'] == 'decode':
+                    instance['expert_offload'].update(
+                        pim_expert_profile_csv='profiler/perf/H200/Qwen/Qwen3-235B-A22B-FP8/fp8-kvfp8/pim_offload/qwen_fast_synth_pim_moe.csv',
+                        pim_profile_time_semantics='end_to_end_excludes_transfer', channel_policy='greedy_load')
             for instance in cluster['nodes'][0]['instances']:
                 if instance['pd_type'] == 'decode':
                     instance['max_num_seqs'] = 1
@@ -250,6 +257,9 @@ class ReplayBackendTests(unittest.TestCase):
                 config = json.loads((ROOT / f'configs/expert_replay/{variant}.json').read_text())
                 config.pop('calibration_file')
                 config['calibration_request_ids'] = ['r0']
+                if variant == 'migration':
+                    config['migration'] = dict(mode='predictive_budgeted_regret', budget_pairs_per_step='auto')
+                    config.pop('hysteresis_options')
                 policy = root / 'policy.json'
                 policy.write_text(json.dumps(config))
                 output = root / (variant + '.csv')

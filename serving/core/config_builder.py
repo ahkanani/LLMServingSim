@@ -374,6 +374,10 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         print(f"Failed to parse JSON from '{cluster_config_path}'.")
         exit(1)
 
+    if native_pd and (cluster_config.get('expert_replay') or {}).get('attachment') == 'network':
+        # Network-attached CPU/PIM groups have their own execution/capacity
+        # model and do not use the host's attention-PIM DRAM configuration.
+        enable_pim = False
     inputs_root, network_config_path, system_config_path, memory_config_path = (
         _prepare_input_config_paths(astra_sim, inputs_root)
     )
@@ -757,6 +761,7 @@ def build_cluster_config(astra_sim, cluster_config_path, enable_local_offloading
         "link_bw": link_bw,
         "link_latency": link_latency,
         "network_topology": network_topology,
+        "expert_replay": cluster_config.get('expert_replay'),
         "inputs_root": inputs_root,
         "network_config_path": network_config_path,
         "system_config_path": system_config_path,
